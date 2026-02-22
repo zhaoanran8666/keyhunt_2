@@ -8,7 +8,7 @@
     #include <Windows.h>
     #include <bcrypt.h>
     #pragma comment(lib, "bcrypt.lib")
-#elif __unix__ || __unix || __APPLE__ || __MACH__ || __CYGWIN__
+#elif __unix__ || __unix || __CYGWIN__
     #include <unistd.h>
     #include <fcntl.h>
     #include <sys/syscall.h>
@@ -16,6 +16,10 @@
     #if defined(GRND_NONBLOCK)
         #define USE_GETRANDOM
     #endif
+#elif __APPLE__ || __MACH__
+    #include <unistd.h>
+    #include <fcntl.h>
+    // macOS 使用 /dev/urandom，不需要 linux/random.h
 #endif
 
 #include "Int.h"

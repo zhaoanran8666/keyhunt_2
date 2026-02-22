@@ -1,3 +1,9 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
 bPfile
 hexcharstoraw
 *.bin
@@ -11,6 +17,7 @@ VANITYKEYFOUND.txt
 
 # Prerequisites
 *.d
+*.work
 
 # Object files
 *.o
