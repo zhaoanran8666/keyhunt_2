@@ -23,12 +23,12 @@
 #include "../SECPK1/SECP256k1.h"
 
 #ifdef USE_SYMMETRY
-#define KSIZE 11
+#define KSIZE 12
 #else
-#define KSIZE 10
+#define KSIZE 11
 #endif
 
-#define ITEM_SIZE   56
+#define ITEM_SIZE   64
 #define ITEM_SIZE32 (ITEM_SIZE/4)
 
 typedef struct {
@@ -40,39 +40,45 @@ typedef struct {
 #ifdef USE_SYMMETRY
 static inline constexpr uint64_t kGpuDistSignBit = 1ULL << 63;
 
-// GPU symmetry path stores 128-bit signed-magnitude distance:
-// d1 bit 63 = sign, remaining bits are |d| low 127 bits.
+// GPU symmetry path stores 192-bit signed-magnitude distance:
+// d2 bit 63 = sign, d2 bit 62 = kType, remaining bits are |d| (190-bit magnitude).
 // CPU keeps distance as 256-bit modulo secp256k1 order, so convert explicitly.
-static inline void EncodeGpuDistanceSym(Int *dist, uint64_t *d0, uint64_t *d1) {
+static inline void EncodeGpuDistanceSym(Int *dist, uint64_t *d0, uint64_t *d1, uint64_t *d2) {
   Int absDist(dist);
   if(absDist.IsZero()) {
     *d0 = 0ULL;
     *d1 = 0ULL;
+    *d2 = 0ULL;
     return;
   }
 
+  // Probability of failure (1/2^192): check bits 192+ for sign
   if(absDist.bits64[3] > 0x7FFFFFFFFFFFFFFFULL) {
     absDist.ModNegK1order();
     if(absDist.IsZero()) {
       *d0 = 0ULL;
       *d1 = 0ULL;
+      *d2 = 0ULL;
       return;
     }
     *d0 = absDist.bits64[0];
-    *d1 = absDist.bits64[1] | kGpuDistSignBit;
+    *d1 = absDist.bits64[1];
+    *d2 = (absDist.bits64[2] & ~kGpuDistSignBit) | kGpuDistSignBit;
     return;
   }
 
   *d0 = absDist.bits64[0];
-  *d1 = absDist.bits64[1] & ~kGpuDistSignBit;
+  *d1 = absDist.bits64[1];
+  *d2 = absDist.bits64[2] & ~kGpuDistSignBit;
 }
 
-static inline void DecodeGpuDistanceSym(uint64_t d0, uint64_t d1, Int *dist) {
+static inline void DecodeGpuDistanceSym(uint64_t d0, uint64_t d1, uint64_t d2, Int *dist) {
   dist->SetInt32(0);
-  uint64_t mag1 = d1 & ~kGpuDistSignBit;
+  uint64_t mag2 = d2 & ~kGpuDistSignBit;
   dist->bits64[0] = d0;
-  dist->bits64[1] = mag1;
-  if((d1 & kGpuDistSignBit) != 0ULL && (d0 != 0ULL || mag1 != 0ULL)) {
+  dist->bits64[1] = d1;
+  dist->bits64[2] = mag2;
+  if((d2 & kGpuDistSignBit) != 0ULL && (d0 != 0ULL || d1 != 0ULL || mag2 != 0ULL)) {
     dist->ModNegK1order();
   }
 }

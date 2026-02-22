@@ -23,7 +23,7 @@ __device__ void ComputeKangaroos(uint64_t *kangaroos,uint32_t maxFound,uint32_t 
 
   uint64_t px[GPU_GRP_SIZE][4];
   uint64_t py[GPU_GRP_SIZE][4];
-  uint64_t dist[GPU_GRP_SIZE][2];
+  uint64_t dist[GPU_GRP_SIZE][3];
 #ifdef USE_SYMMETRY
   uint64_t lastJump[GPU_GRP_SIZE];
 #endif
@@ -87,9 +87,9 @@ __device__ void ComputeKangaroos(uint64_t *kangaroos,uint32_t maxFound,uint32_t 
       Load256(py[g],ry);
 
 #ifdef USE_SYMMETRY
-      DistAddSigned128(dist[g],jD[jmp]);
+      DistAddSigned192(dist[g],jD[jmp]);
       if(ModPositive256(py[g])) {
-        DistToggleSign128(dist[g]);
+        DistToggleSign192(dist[g]);
       }
 #else
       Add128(dist[g],jD[jmp]);

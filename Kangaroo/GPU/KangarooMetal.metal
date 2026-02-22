@@ -11,7 +11,7 @@ using namespace metal;
 #define KANGAROO_METAL_USE_UNSIGNED_MULHI 0
 #endif
 
-constant uint kItemSize32 = 14;
+constant uint kItemSize32 = 16;
 constant uint kNbJump = 32;
 
 // Compile-time specialization knobs (injected by GPUEngineMetal via preprocessorMacros).
@@ -786,6 +786,65 @@ inline void dist_toggle_sign_128(thread ulong &d0, thread ulong &d1) {
 inline void dist_toggle_sign_128(thread ulong d[2]) {
   dist_toggle_sign_128(d[0], d[1]);
 }
+
+// 192-bit 有符号距离操作 (新格式: d[2] bit63=符号位, d[2] bits62-0+d[1]+d[0] = 190-bit量)
+// jump 距离仅用 jmp0/jmp1 (≤67-bit), jmp2 隐式为 0
+
+inline void dist_add_signed_192(thread ulong &d0, thread ulong &d1, thread ulong &d2,
+                                 ulong jmp0, ulong jmp1) {
+  ulong signBit = d2 & kDistSignBit;
+  d2 &= ~kDistSignBit;  // 清除符号位，得到量的高位
+
+  if(signBit == 0ull) {
+    // 正距离: |d| += jmp
+    ulong carry = 0ull;
+    d0 = addcarry_u64(d0, jmp0, carry);
+    d1 = addcarry_u64(d1, jmp1, carry);
+    d2 = addcarry_u64(d2, 0ull, carry);
+  } else {
+    // 负距离: |d| -= jmp
+    ulong borrow = 0ull;
+    ulong r0 = subborrow_u64(d0, jmp0, borrow);
+    ulong r1 = subborrow_u64(d1, jmp1, borrow);
+    ulong r2 = subborrow_u64(d2, 0ull, borrow);
+    if(borrow != 0ull) {
+      // |d| < jmp: 结果变正, |result| = jmp - |d|
+      borrow = 0ull;
+      d0 = subborrow_u64(jmp0, d0, borrow);
+      d1 = subborrow_u64(jmp1, d1, borrow);
+      d2 = subborrow_u64(0ull, d2, borrow);
+      signBit = 0ull;
+    } else {
+      d0 = r0;
+      d1 = r1;
+      d2 = r2;
+    }
+  }
+
+  // 规范化符号零: +0
+  if((d0 | d1 | d2) == 0ull) {
+    signBit = 0ull;
+  }
+
+  d2 |= signBit;
+}
+
+// 数组版本: dCache[g] 格式 (3个元素)
+inline void dist_add_signed_192(thread ulong d[3], ulong jmp0, ulong jmp1) {
+  dist_add_signed_192(d[0], d[1], d[2], jmp0, jmp1);
+}
+
+inline void dist_toggle_sign_192(thread ulong &d0, thread ulong &d1, thread ulong &d2) {
+  if((d0 | d1 | (d2 & ~kDistSignBit)) == 0ull) {
+    d2 &= ~kDistSignBit;  // 规范化零为 +0
+  } else {
+    d2 ^= kDistSignBit;
+  }
+}
+
+inline void dist_toggle_sign_192(thread ulong d[3]) {
+  dist_toggle_sign_192(d[0], d[1], d[2]);
+}
 #endif
 
 inline bool is_ge_p(thread const ulong a[4]) {
@@ -1496,7 +1555,7 @@ kernel void kangaroo_step(device ulong *kangaroos [[buffer(0)]],
 
   thread ulong pxCache[kGpuGroupSize][4];
   thread ulong pyCache[kGpuGroupSize][4];
-  thread ulong dCache[kGpuGroupSize][2];
+  thread ulong dCache[kGpuGroupSize][3];
   thread ulong dxInv[kGpuGroupSize][4];
   thread ulong prefix[kGpuGroupSize][4];
 #if KANGAROO_METAL_USE_SYMMETRY
@@ -1530,8 +1589,9 @@ kernel void kangaroo_step(device ulong *kangaroos [[buffer(0)]],
 
     dCache[g][0] = kangaroos[idx0 + 8u * params.nbThreadPerGroup];
     dCache[g][1] = kangaroos[idx0 + 9u * params.nbThreadPerGroup];
+    dCache[g][2] = kangaroos[idx0 + 10u * params.nbThreadPerGroup];
 #if KANGAROO_METAL_USE_SYMMETRY
-    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 10u * params.nbThreadPerGroup]) & 1u;
+    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 11u * params.nbThreadPerGroup]) & 1u;
 #endif
   }
 
@@ -1592,15 +1652,16 @@ kernel void kangaroo_step(device ulong *kangaroos [[buffer(0)]],
 
 #if KANGAROO_METAL_USE_SYMMETRY
       // 有符号距离累加 + 对称翻转
-      dist_add_signed_128(dCache[g], tgJumpD[j][0], tgJumpD[j][1]);
+      dist_add_signed_192(dCache[g], tgJumpD[j][0], tgJumpD[j][1]);
       if(mod_positive_256(ry)) {
-        dist_toggle_sign_128(dCache[g]);
+        dist_toggle_sign_192(dCache[g]);
         symClassCache[g] ^= 1u;
       }
 #else
       ulong carry = 0ull;
       dCache[g][0] = addcarry_u64(dCache[g][0], tgJumpD[j][0], carry);
       dCache[g][1] = addcarry_u64(dCache[g][1], tgJumpD[j][1], carry);
+      dCache[g][2] = addcarry_u64(dCache[g][2], 0ull, carry);
 #endif
 
       pxCache[g][0] = rx[0];
@@ -1627,18 +1688,20 @@ kernel void kangaroo_step(device ulong *kangaroos [[buffer(0)]],
           outWords[outBase + 6u] = lo32(rx[3]);
           outWords[outBase + 7u] = hi32(rx[3]);
 
-          outWords[outBase + 8u] = lo32(dCache[g][0]);
-          outWords[outBase + 9u] = hi32(dCache[g][0]);
+          outWords[outBase + 8u]  = lo32(dCache[g][0]);
+          outWords[outBase + 9u]  = hi32(dCache[g][0]);
           outWords[outBase + 10u] = lo32(dCache[g][1]);
           outWords[outBase + 11u] = hi32(dCache[g][1]);
+          outWords[outBase + 12u] = lo32(dCache[g][2]);
+          outWords[outBase + 13u] = hi32(dCache[g][2]);
 
           ulong kIdx = static_cast<ulong>(localTid) +
                        static_cast<ulong>(g) * static_cast<ulong>(params.nbThreadPerGroup) +
                        static_cast<ulong>(groupId) *
                            static_cast<ulong>(params.nbThreadPerGroup * kGpuGroupSize);
 
-          outWords[outBase + 12u] = lo32(kIdx);
-          outWords[outBase + 13u] = hi32(kIdx);
+          outWords[outBase + 14u] = lo32(kIdx);
+          outWords[outBase + 15u] = hi32(kIdx);
         }
       }
     }
@@ -1657,10 +1720,11 @@ kernel void kangaroo_step(device ulong *kangaroos [[buffer(0)]],
     kangaroos[idx0 + 6u * params.nbThreadPerGroup] = pyCache[g][2];
     kangaroos[idx0 + 7u * params.nbThreadPerGroup] = pyCache[g][3];
 
-    kangaroos[idx0 + 8u * params.nbThreadPerGroup] = dCache[g][0];
-    kangaroos[idx0 + 9u * params.nbThreadPerGroup] = dCache[g][1];
+    kangaroos[idx0 + 8u * params.nbThreadPerGroup]  = dCache[g][0];
+    kangaroos[idx0 + 9u * params.nbThreadPerGroup]  = dCache[g][1];
+    kangaroos[idx0 + 10u * params.nbThreadPerGroup] = dCache[g][2];
 #if KANGAROO_METAL_USE_SYMMETRY
-    kangaroos[idx0 + 10u * params.nbThreadPerGroup] = static_cast<ulong>(symClassCache[g]);
+    kangaroos[idx0 + 11u * params.nbThreadPerGroup] = static_cast<ulong>(symClassCache[g]);
 #endif
   }
 
@@ -1746,7 +1810,7 @@ kernel void kangaroo_step_nocache(device ulong *kangaroos [[buffer(0)]],
 #if KANGAROO_METAL_USE_SYMMETRY
   for(uint g = 0; g < kGpuGroupSize; g++) {
     const uint idx0 = blockBase + g * strideSize + localTid;
-    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 10u * nt]) & 1u;
+    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 11u * nt]) & 1u;
   }
 #endif
 
@@ -1824,6 +1888,7 @@ kernel void kangaroo_step_nocache(device ulong *kangaroos [[buffer(0)]],
 
       ulong d0 = kangaroos[idx0 + 8u * nt];
       ulong d1 = kangaroos[idx0 + 9u * nt];
+      ulong d2 = kangaroos[idx0 + 10u * nt];
 
       uint j = jump_index(px[0]);
 #if KANGAROO_METAL_USE_SYMMETRY
@@ -1884,15 +1949,16 @@ kernel void kangaroo_step_nocache(device ulong *kangaroos [[buffer(0)]],
 
 #if KANGAROO_METAL_USE_SYMMETRY
       // 有符号距离累加 + 对称翻转
-      dist_add_signed_128(d0, d1, tgJumpD[j][0], tgJumpD[j][1]);
+      dist_add_signed_192(d0, d1, d2, tgJumpD[j][0], tgJumpD[j][1]);
       if(mod_positive_256(ry)) {
-        dist_toggle_sign_128(d0, d1);
+        dist_toggle_sign_192(d0, d1, d2);
         symClassCache[g] ^= 1u;
       }
 #else
       ulong carry = 0ull;
       d0 = addcarry_u64(d0, tgJumpD[j][0], carry);
       d1 = addcarry_u64(d1, tgJumpD[j][1], carry);
+      d2 = addcarry_u64(d2, 0ull, carry);
 #endif
 
       if(g != 0u) {
@@ -1916,10 +1982,11 @@ kernel void kangaroo_step_nocache(device ulong *kangaroos [[buffer(0)]],
       kangaroos[idx0 + 6u * nt] = ry[2];
       kangaroos[idx0 + 7u * nt] = ry[3];
 
-      kangaroos[idx0 + 8u * nt] = d0;
-      kangaroos[idx0 + 9u * nt] = d1;
+      kangaroos[idx0 + 8u * nt]  = d0;
+      kangaroos[idx0 + 9u * nt]  = d1;
+      kangaroos[idx0 + 10u * nt] = d2;
 #if KANGAROO_METAL_USE_SYMMETRY
-      kangaroos[idx0 + 10u * nt] = static_cast<ulong>(symClassCache[g]);
+      kangaroos[idx0 + 11u * nt] = static_cast<ulong>(symClassCache[g]);
 #endif
 
       if((rx[3] & params.dpMask) == 0ull) {
@@ -1936,17 +2003,19 @@ kernel void kangaroo_step_nocache(device ulong *kangaroos [[buffer(0)]],
           outWords[outBase + 6u] = lo32(rx[3]);
           outWords[outBase + 7u] = hi32(rx[3]);
 
-          outWords[outBase + 8u] = lo32(d0);
-          outWords[outBase + 9u] = hi32(d0);
+          outWords[outBase + 8u]  = lo32(d0);
+          outWords[outBase + 9u]  = hi32(d0);
           outWords[outBase + 10u] = lo32(d1);
           outWords[outBase + 11u] = hi32(d1);
+          outWords[outBase + 12u] = lo32(d2);
+          outWords[outBase + 13u] = hi32(d2);
 
           ulong kIdx = static_cast<ulong>(localTid) +
                        static_cast<ulong>(g) * static_cast<ulong>(nt) +
                        static_cast<ulong>(groupId) * static_cast<ulong>(nt * kGpuGroupSize);
 
-          outWords[outBase + 12u] = lo32(kIdx);
-          outWords[outBase + 13u] = hi32(kIdx);
+          outWords[outBase + 14u] = lo32(kIdx);
+          outWords[outBase + 15u] = hi32(kIdx);
         }
       }
     }
@@ -2021,7 +2090,7 @@ kernel void kangaroo_step_jacobian_mixed(device ulong *kangaroos [[buffer(0)]],
   thread ulong jacX[kGpuGroupSize][4];
   thread ulong jacY[kGpuGroupSize][4];
   thread ulong jacZ[kGpuGroupSize][4];
-  thread ulong dCache[kGpuGroupSize][2];
+  thread ulong dCache[kGpuGroupSize][3];
   thread ulong zInv[kGpuGroupSize][4];
   thread ulong prefix[kGpuGroupSize][4];
 #if KANGAROO_METAL_ENABLE_INV_PROFILE
@@ -2052,6 +2121,7 @@ kernel void kangaroo_step_jacobian_mixed(device ulong *kangaroos [[buffer(0)]],
 
     dCache[g][0] = kangaroos[idx0 + 8u * nt];
     dCache[g][1] = kangaroos[idx0 + 9u * nt];
+    dCache[g][2] = kangaroos[idx0 + 10u * nt];
   }
 
   for(uint run = 0; run < kNbRun; run++) {
@@ -2118,17 +2188,19 @@ kernel void kangaroo_step_jacobian_mixed(device ulong *kangaroos [[buffer(0)]],
           outWords[outBase + 6u] = lo32(xAff[3]);
           outWords[outBase + 7u] = hi32(xAff[3]);
 
-          outWords[outBase + 8u] = lo32(dCache[g][0]);
-          outWords[outBase + 9u] = hi32(dCache[g][0]);
+          outWords[outBase + 8u]  = lo32(dCache[g][0]);
+          outWords[outBase + 9u]  = hi32(dCache[g][0]);
           outWords[outBase + 10u] = lo32(dCache[g][1]);
           outWords[outBase + 11u] = hi32(dCache[g][1]);
+          outWords[outBase + 12u] = lo32(dCache[g][2]);
+          outWords[outBase + 13u] = hi32(dCache[g][2]);
 
           ulong kIdx = static_cast<ulong>(localTid) +
                        static_cast<ulong>(g) * static_cast<ulong>(nt) +
                        static_cast<ulong>(groupId) * static_cast<ulong>(nt * kGpuGroupSize);
 
-          outWords[outBase + 12u] = lo32(kIdx);
-          outWords[outBase + 13u] = hi32(kIdx);
+          outWords[outBase + 14u] = lo32(kIdx);
+          outWords[outBase + 15u] = hi32(kIdx);
         }
       }
 
@@ -2145,6 +2217,7 @@ kernel void kangaroo_step_jacobian_mixed(device ulong *kangaroos [[buffer(0)]],
       ulong carry = 0ull;
       dCache[g][0] = addcarry_u64(dCache[g][0], tgJumpD[j][0], carry);
       dCache[g][1] = addcarry_u64(dCache[g][1], tgJumpD[j][1], carry);
+      dCache[g][2] = addcarry_u64(dCache[g][2], 0ull, carry);
     }
   }
 
@@ -2212,8 +2285,9 @@ kernel void kangaroo_step_jacobian_mixed(device ulong *kangaroos [[buffer(0)]],
     kangaroos[idx0 + 6u * nt] = yAff[2];
     kangaroos[idx0 + 7u * nt] = yAff[3];
 
-    kangaroos[idx0 + 8u * nt] = dCache[g][0];
-    kangaroos[idx0 + 9u * nt] = dCache[g][1];
+    kangaroos[idx0 + 8u * nt]  = dCache[g][0];
+    kangaroos[idx0 + 9u * nt]  = dCache[g][1];
+    kangaroos[idx0 + 10u * nt] = dCache[g][2];
   }
 
 #if KANGAROO_METAL_ENABLE_INV_PROFILE
@@ -2303,7 +2377,7 @@ kernel void kangaroo_step_simd_inv(device ulong *kangaroos [[buffer(0)]],
 #if KANGAROO_METAL_USE_SYMMETRY
   for(uint g = 0; g < kGpuGroupSize; g++) {
     const uint idx0 = blockBase + g * strideSize + localTid;
-    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 10u * nt]) & 1u;
+    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 11u * nt]) & 1u;
   }
 #endif
 
@@ -2427,6 +2501,7 @@ kernel void kangaroo_step_simd_inv(device ulong *kangaroos [[buffer(0)]],
 
       ulong d0 = kangaroos[idx0 + 8u * nt];
       ulong d1 = kangaroos[idx0 + 9u * nt];
+      ulong d2 = kangaroos[idx0 + 10u * nt];
 
       uint j = jump_index(px[0]);
 #if KANGAROO_METAL_USE_SYMMETRY
@@ -2488,15 +2563,16 @@ kernel void kangaroo_step_simd_inv(device ulong *kangaroos [[buffer(0)]],
 
 #if KANGAROO_METAL_USE_SYMMETRY
       // 有符号距离累加 + 对称翻转
-      dist_add_signed_128(d0, d1, tgJumpD[j][0], tgJumpD[j][1]);
+      dist_add_signed_192(d0, d1, d2, tgJumpD[j][0], tgJumpD[j][1]);
       if(mod_positive_256(ry)) {
-        dist_toggle_sign_128(d0, d1);
+        dist_toggle_sign_192(d0, d1, d2);
         symClassCache[g] ^= 1u;
       }
 #else
       ulong carry = 0ull;
       d0 = addcarry_u64(d0, tgJumpD[j][0], carry);
       d1 = addcarry_u64(d1, tgJumpD[j][1], carry);
+      d2 = addcarry_u64(d2, 0ull, carry);
 #endif
 
       if(g != 0u) {
@@ -2519,10 +2595,11 @@ kernel void kangaroo_step_simd_inv(device ulong *kangaroos [[buffer(0)]],
       kangaroos[idx0 + 6u * nt] = ry[2];
       kangaroos[idx0 + 7u * nt] = ry[3];
 
-      kangaroos[idx0 + 8u * nt] = d0;
-      kangaroos[idx0 + 9u * nt] = d1;
+      kangaroos[idx0 + 8u * nt]  = d0;
+      kangaroos[idx0 + 9u * nt]  = d1;
+      kangaroos[idx0 + 10u * nt] = d2;
 #if KANGAROO_METAL_USE_SYMMETRY
-      kangaroos[idx0 + 10u * nt] = static_cast<ulong>(symClassCache[g]);
+      kangaroos[idx0 + 11u * nt] = static_cast<ulong>(symClassCache[g]);
 #endif
 
       if((rx[3] & params.dpMask) == 0ull) {
@@ -2539,17 +2616,19 @@ kernel void kangaroo_step_simd_inv(device ulong *kangaroos [[buffer(0)]],
           outWords[outBase + 6u] = lo32(rx[3]);
           outWords[outBase + 7u] = hi32(rx[3]);
 
-          outWords[outBase + 8u] = lo32(d0);
-          outWords[outBase + 9u] = hi32(d0);
+          outWords[outBase + 8u]  = lo32(d0);
+          outWords[outBase + 9u]  = hi32(d0);
           outWords[outBase + 10u] = lo32(d1);
           outWords[outBase + 11u] = hi32(d1);
+          outWords[outBase + 12u] = lo32(d2);
+          outWords[outBase + 13u] = hi32(d2);
 
           ulong kIdx = static_cast<ulong>(localTid) +
                        static_cast<ulong>(g) * static_cast<ulong>(nt) +
                        static_cast<ulong>(groupId) * static_cast<ulong>(nt * kGpuGroupSize);
 
-          outWords[outBase + 12u] = lo32(kIdx);
-          outWords[outBase + 13u] = hi32(kIdx);
+          outWords[outBase + 14u] = lo32(kIdx);
+          outWords[outBase + 15u] = hi32(kIdx);
         }
       }
     }
@@ -2618,7 +2697,7 @@ kernel void kangaroo_step_nocache_dcache(device ulong *kangaroos [[buffer(0)]],
 
   device atomic_uint *counter = reinterpret_cast<device atomic_uint *>(outWords);
 
-  thread ulong dCache[kGpuGroupSize][2];
+  thread ulong dCache[kGpuGroupSize][3];
   thread ulong dxInv[kGpuGroupSize][4];
   thread ulong prefix[kGpuGroupSize][4];
 #if KANGAROO_METAL_USE_SYMMETRY
@@ -2640,8 +2719,9 @@ kernel void kangaroo_step_nocache_dcache(device ulong *kangaroos [[buffer(0)]],
     const uint idx0 = blockBase + g * strideSize + localTid;
     dCache[g][0] = kangaroos[idx0 + 8u * nt];
     dCache[g][1] = kangaroos[idx0 + 9u * nt];
+    dCache[g][2] = kangaroos[idx0 + 10u * nt];
 #if KANGAROO_METAL_USE_SYMMETRY
-    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 10u * nt]) & 1u;
+    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 11u * nt]) & 1u;
 #endif
   }
 
@@ -2724,15 +2804,16 @@ kernel void kangaroo_step_nocache_dcache(device ulong *kangaroos [[buffer(0)]],
 
 #if KANGAROO_METAL_USE_SYMMETRY
       // 有符号距离累加 + 对称翻转
-      dist_add_signed_128(dCache[g], tgJumpD[j][0], tgJumpD[j][1]);
+      dist_add_signed_192(dCache[g], tgJumpD[j][0], tgJumpD[j][1]);
       if(mod_positive_256(ry)) {
-        dist_toggle_sign_128(dCache[g]);
+        dist_toggle_sign_192(dCache[g]);
         symClassCache[g] ^= 1u;
       }
 #else
       ulong carry = 0ull;
       dCache[g][0] = addcarry_u64(dCache[g][0], tgJumpD[j][0], carry);
       dCache[g][1] = addcarry_u64(dCache[g][1], tgJumpD[j][1], carry);
+      dCache[g][2] = addcarry_u64(dCache[g][2], 0ull, carry);
 #endif
 
       // Store X/Y every run so following runs observe updated state.
@@ -2760,17 +2841,19 @@ kernel void kangaroo_step_nocache_dcache(device ulong *kangaroos [[buffer(0)]],
           outWords[outBase + 6u] = lo32(rx[3]);
           outWords[outBase + 7u] = hi32(rx[3]);
 
-          outWords[outBase + 8u] = lo32(dCache[g][0]);
-          outWords[outBase + 9u] = hi32(dCache[g][0]);
+          outWords[outBase + 8u]  = lo32(dCache[g][0]);
+          outWords[outBase + 9u]  = hi32(dCache[g][0]);
           outWords[outBase + 10u] = lo32(dCache[g][1]);
           outWords[outBase + 11u] = hi32(dCache[g][1]);
+          outWords[outBase + 12u] = lo32(dCache[g][2]);
+          outWords[outBase + 13u] = hi32(dCache[g][2]);
 
           ulong kIdx = static_cast<ulong>(localTid) +
                        static_cast<ulong>(g) * static_cast<ulong>(nt) +
                        static_cast<ulong>(groupId) * static_cast<ulong>(nt * kGpuGroupSize);
 
-          outWords[outBase + 12u] = lo32(kIdx);
-          outWords[outBase + 13u] = hi32(kIdx);
+          outWords[outBase + 14u] = lo32(kIdx);
+          outWords[outBase + 15u] = hi32(kIdx);
         }
       }
     }
@@ -2779,10 +2862,11 @@ kernel void kangaroo_step_nocache_dcache(device ulong *kangaroos [[buffer(0)]],
   // Write back D once per launch.
   for(uint g = 0; g < kGpuGroupSize; g++) {
     const uint idx0 = blockBase + g * strideSize + localTid;
-    kangaroos[idx0 + 8u * nt] = dCache[g][0];
-    kangaroos[idx0 + 9u * nt] = dCache[g][1];
+    kangaroos[idx0 + 8u * nt]  = dCache[g][0];
+    kangaroos[idx0 + 9u * nt]  = dCache[g][1];
+    kangaroos[idx0 + 10u * nt] = dCache[g][2];
 #if KANGAROO_METAL_USE_SYMMETRY
-    kangaroos[idx0 + 10u * nt] = static_cast<ulong>(symClassCache[g]);
+    kangaroos[idx0 + 11u * nt] = static_cast<ulong>(symClassCache[g]);
 #endif
   }
 
@@ -2873,7 +2957,7 @@ kernel void kangaroo_step_nocache_pxcache(device ulong *kangaroos [[buffer(0)]],
     pxCache[g][2] = kangaroos[idx0 + 2u * nt];
     pxCache[g][3] = kangaroos[idx0 + 3u * nt];
 #if KANGAROO_METAL_USE_SYMMETRY
-    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 10u * nt]) & 1u;
+    symClassCache[g] = static_cast<uint>(kangaroos[idx0 + 11u * nt]) & 1u;
 #endif
   }
 
@@ -2914,6 +2998,7 @@ kernel void kangaroo_step_nocache_pxcache(device ulong *kangaroos [[buffer(0)]],
 
       ulong d0 = kangaroos[idx0 + 8u * nt];
       ulong d1 = kangaroos[idx0 + 9u * nt];
+      ulong d2 = kangaroos[idx0 + 10u * nt];
 
       uint j = jump_index(pxCache[g][0]);
 #if KANGAROO_METAL_USE_SYMMETRY
@@ -2945,15 +3030,16 @@ kernel void kangaroo_step_nocache_pxcache(device ulong *kangaroos [[buffer(0)]],
 
 #if KANGAROO_METAL_USE_SYMMETRY
       // 有符号距离累加 + 对称翻转
-      dist_add_signed_128(d0, d1, tgJumpD[j][0], tgJumpD[j][1]);
+      dist_add_signed_192(d0, d1, d2, tgJumpD[j][0], tgJumpD[j][1]);
       if(mod_positive_256(ry)) {
-        dist_toggle_sign_128(d0, d1);
+        dist_toggle_sign_192(d0, d1, d2);
         symClassCache[g] ^= 1u;
       }
 #else
       ulong carry = 0ull;
       d0 = addcarry_u64(d0, tgJumpD[j][0], carry);
       d1 = addcarry_u64(d1, tgJumpD[j][1], carry);
+      d2 = addcarry_u64(d2, 0ull, carry);
 #endif
 
       // Keep X in local cache for next run to avoid reloading from global memory.
@@ -2973,10 +3059,11 @@ kernel void kangaroo_step_nocache_pxcache(device ulong *kangaroos [[buffer(0)]],
       kangaroos[idx0 + 6u * nt] = ry[2];
       kangaroos[idx0 + 7u * nt] = ry[3];
 
-      kangaroos[idx0 + 8u * nt] = d0;
-      kangaroos[idx0 + 9u * nt] = d1;
+      kangaroos[idx0 + 8u * nt]  = d0;
+      kangaroos[idx0 + 9u * nt]  = d1;
+      kangaroos[idx0 + 10u * nt] = d2;
 #if KANGAROO_METAL_USE_SYMMETRY
-      kangaroos[idx0 + 10u * nt] = static_cast<ulong>(symClassCache[g]);
+      kangaroos[idx0 + 11u * nt] = static_cast<ulong>(symClassCache[g]);
 #endif
 
       if((rx[3] & params.dpMask) == 0ull) {
@@ -2993,17 +3080,19 @@ kernel void kangaroo_step_nocache_pxcache(device ulong *kangaroos [[buffer(0)]],
           outWords[outBase + 6u] = lo32(rx[3]);
           outWords[outBase + 7u] = hi32(rx[3]);
 
-          outWords[outBase + 8u] = lo32(d0);
-          outWords[outBase + 9u] = hi32(d0);
+          outWords[outBase + 8u]  = lo32(d0);
+          outWords[outBase + 9u]  = hi32(d0);
           outWords[outBase + 10u] = lo32(d1);
           outWords[outBase + 11u] = hi32(d1);
+          outWords[outBase + 12u] = lo32(d2);
+          outWords[outBase + 13u] = hi32(d2);
 
           ulong kIdx = static_cast<ulong>(localTid) +
                        static_cast<ulong>(g) * static_cast<ulong>(nt) +
                        static_cast<ulong>(groupId) * static_cast<ulong>(nt * kGpuGroupSize);
 
-          outWords[outBase + 12u] = lo32(kIdx);
-          outWords[outBase + 13u] = hi32(kIdx);
+          outWords[outBase + 14u] = lo32(kIdx);
+          outWords[outBase + 15u] = hi32(kIdx);
         }
       }
     }

@@ -184,22 +184,24 @@ out[pos*ITEM_SIZE32 + 9] = ((uint32_t *)d)[0]; \
 out[pos*ITEM_SIZE32 + 10] = ((uint32_t *)d)[1]; \
 out[pos*ITEM_SIZE32 + 11] = ((uint32_t *)d)[2]; \
 out[pos*ITEM_SIZE32 + 12] = ((uint32_t *)d)[3]; \
-out[pos*ITEM_SIZE32 + 13] = ((uint32_t *)idx)[0]; \
-out[pos*ITEM_SIZE32 + 14] = ((uint32_t *)idx)[1]; \
+out[pos*ITEM_SIZE32 + 13] = ((uint32_t *)d)[4]; \
+out[pos*ITEM_SIZE32 + 14] = ((uint32_t *)d)[5]; \
+out[pos*ITEM_SIZE32 + 15] = ((uint32_t *)idx)[0]; \
+out[pos*ITEM_SIZE32 + 16] = ((uint32_t *)idx)[1]; \
 }
 
 // ---------------------------------------------------------------------------------------
 
 #ifdef USE_SYMMETRY
-__device__ void LoadKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][2],uint64_t *jumps) {
+__device__ void LoadKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3],uint64_t *jumps) {
 #else
-__device__ void LoadKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][2]) {
+__device__ void LoadKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3]) {
 #endif
 
   __syncthreads();
 
   for(int g = 0; g<GPU_GRP_SIZE; g++) {
-    
+
     uint64_t *x64 = (uint64_t *)px[g];
     uint64_t *y64 = (uint64_t *)py[g];
     uint64_t *d64 = (uint64_t *)dist[g];
@@ -217,15 +219,16 @@ __device__ void LoadKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t
 
     d64[0] = (a)[IDX + 8 * blockDim.x + stride];
     d64[1] = (a)[IDX + 9 * blockDim.x + stride];
+    d64[2] = (a)[IDX + 10 * blockDim.x + stride];
 
 #ifdef USE_SYMMETRY
-    jumps[g] = (a)[IDX + 10 * blockDim.x + stride];
+    jumps[g] = (a)[IDX + 11 * blockDim.x + stride];
 #endif
   }
 
 }
 
-__device__ void LoadDists(uint64_t* a,uint64_t dist[GPU_GRP_SIZE][2]) {
+__device__ void LoadDists(uint64_t* a,uint64_t dist[GPU_GRP_SIZE][3]) {
 
   __syncthreads();
 
@@ -236,6 +239,7 @@ __device__ void LoadDists(uint64_t* a,uint64_t dist[GPU_GRP_SIZE][2]) {
 
     d64[0] = (a)[IDX + 8 * blockDim.x + stride];
     d64[1] = (a)[IDX + 9 * blockDim.x + stride];
+    d64[2] = (a)[IDX + 10 * blockDim.x + stride];
 
   }
 
@@ -272,9 +276,9 @@ __device__ void LoadKangaroo(uint64_t* a,uint32_t stride,uint64_t px[4]) {
 // ---------------------------------------------------------------------------------------
 
 #ifdef USE_SYMMETRY
-__device__ void StoreKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][2],uint64_t *jumps) {
+__device__ void StoreKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3],uint64_t *jumps) {
 #else
-__device__ void StoreKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][2]) {
+__device__ void StoreKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3]) {
 #endif
 
   __syncthreads();
@@ -297,9 +301,10 @@ __device__ void StoreKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_
 
     (a)[IDX + 8 * blockDim.x + stride] = d64[0];
     (a)[IDX + 9 * blockDim.x + stride] = d64[1];
+    (a)[IDX + 10 * blockDim.x + stride] = d64[2];
 
 #ifdef USE_SYMMETRY
-    (a)[IDX + 10 * blockDim.x + stride] = jumps[g];
+    (a)[IDX + 11 * blockDim.x + stride] = jumps[g];
 #endif
   }
 
@@ -322,7 +327,7 @@ __device__ void StoreKangaroo(uint64_t* a,uint32_t stride,uint64_t px[4],uint64_
 
 }
 
-__device__ void StoreDists(uint64_t* a,uint64_t dist[GPU_GRP_SIZE][2]) {
+__device__ void StoreDists(uint64_t* a,uint64_t dist[GPU_GRP_SIZE][3]) {
 
   __syncthreads();
 
@@ -332,6 +337,7 @@ __device__ void StoreDists(uint64_t* a,uint64_t dist[GPU_GRP_SIZE][2]) {
 
     (a)[IDX + 8 * blockDim.x + stride] = d64[0];
     (a)[IDX + 9 * blockDim.x + stride] = d64[1];
+    (a)[IDX + 10 * blockDim.x + stride] = d64[2];
 
   }
 
@@ -559,6 +565,75 @@ __device__ __forceinline__ void DistToggleSign128(uint64_t *r) {
     r[1] = 0ULL;
   } else {
     r[1] ^= DIST_SIGN_BIT;
+  }
+}
+
+// 192-bit signed-magnitude distance operations.
+// Layout: r[2] bit63=sign, r[2] bit62=kType (preserved), r[2] bits61-0=magnitude high.
+// Jump distance a[0..1] is ~67-bit; a[2] is implicit 0.
+
+__device__ __forceinline__ void DistAddSigned192(uint64_t *r, const uint64_t *a) {
+
+  uint64_t sign = r[2] & DIST_SIGN_BIT;
+  uint64_t type = r[2] & 0x4000000000000000ULL;
+  uint64_t mag0 = r[0];
+  uint64_t mag1 = r[1];
+  uint64_t mag2 = r[2] & 0x3FFFFFFFFFFFFFFFULL;
+
+  if(sign == 0ULL) {
+    // Positive: mag += jump (a[2] implicit 0, carry propagates into mag2)
+    uint64_t lo = mag0 + a[0];
+    uint64_t c1 = (lo < mag0) ? 1ULL : 0ULL;
+    uint64_t mid_t = mag1 + a[1];
+    uint64_t c2 = (mid_t < mag1) ? 1ULL : 0ULL;
+    uint64_t mid = mid_t + c1;
+    c2 += (mid < mid_t) ? 1ULL : 0ULL;
+    mag0 = lo;
+    mag1 = mid;
+    mag2 = mag2 + c2;
+  } else {
+    // Negative: compare |d| vs jump
+    bool magGeJump = (mag2 > 0ULL) ||
+                     (mag1 > a[1]) ||
+                     (mag1 == a[1] && mag0 >= a[0]);
+    if(magGeJump) {
+      // |d| >= jump: keep sign, |d| -= jump
+      uint64_t b1 = (mag0 < a[0]) ? 1ULL : 0ULL;
+      mag0 = mag0 - a[0];
+      uint64_t sub1 = mag1 - a[1];
+      uint64_t b2 = (mag1 < a[1]) ? 1ULL : 0ULL;
+      mag1 = sub1 - b1;
+      b2 += (sub1 < b1) ? 1ULL : 0ULL;
+      mag2 = mag2 - b2;
+    } else {
+      // |d| < jump: flip sign, result = jump - |d|
+      // (mag2 must be 0 here since |d| < 128-bit jump)
+      uint64_t b1 = (a[0] < mag0) ? 1ULL : 0ULL;
+      mag0 = a[0] - mag0;
+      uint64_t sub1 = a[1] - mag1;
+      uint64_t b2 = (a[1] < mag1) ? 1ULL : 0ULL;
+      mag1 = sub1 - b1;
+      b2 += (sub1 < b1) ? 1ULL : 0ULL;
+      mag2 = 0ULL - b2;
+      sign = 0ULL;
+    }
+  }
+
+  // Canonicalize signed zero to +0
+  if((mag0 | mag1 | mag2) == 0ULL) {
+    sign = 0ULL;
+  }
+
+  r[0] = mag0;
+  r[1] = mag1;
+  r[2] = mag2 | sign | type;
+}
+
+__device__ __forceinline__ void DistToggleSign192(uint64_t *r) {
+  if((r[0] | r[1] | (r[2] & ~DIST_SIGN_BIT)) == 0ULL) {
+    r[2] &= ~DIST_SIGN_BIT;  // Canonicalize: -0 -> +0
+  } else {
+    r[2] ^= DIST_SIGN_BIT;
   }
 }
 

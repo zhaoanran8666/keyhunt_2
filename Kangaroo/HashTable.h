@@ -44,14 +44,24 @@ union int128_s {
 
 typedef union int128_s int128_t;
 
+// 192-bit distance: i64[2] bit63=sign, i64[2] bit62=kType, bits189..0=magnitude
+union int192_s {
+
+  uint32_t i32[6];
+  uint64_t i64[3];
+
+};
+
+typedef union int192_s int192_t;
+
 #define safe_free(x) if(x) {free(x);x=NULL;}
 
 // We store only 128 (+18) bit a the x value which give a probabilty a wrong collision after 2^73 entries
 
 typedef struct {
 
-  int128_t  x;    // Poisition of kangaroo (128bit LSB)
-  int128_t  d;    // Travelled distance (b127=sign b126=kangaroo type, b125..b0 distance
+  int128_t  x;    // Position of kangaroo (128bit LSB)
+  int192_t  d;    // Travelled distance (b191=sign b190=kangaroo type, b189..b0 distance, 190-bit magnitude)
 
 } ENTRY;
 
@@ -69,7 +79,7 @@ public:
 
   HashTable();
   int Add(Int *x,Int *d,uint32_t type);
-  int Add(uint64_t h,int128_t *x,int128_t *d);
+  int Add(uint64_t h,int128_t *x,int192_t *d);
   int Add(uint64_t h,ENTRY *e);
   uint64_t GetNbItem();
   void Reset();
@@ -90,18 +100,18 @@ public:
   bool     kHasCollisionRaw;
   uint64_t kHashBucket;
   int128_t kXExisting;
-  int128_t kDExisting;
+  int192_t kDExisting;
   int128_t kXIncoming;
-  int128_t kDIncoming;
+  int192_t kDIncoming;
 
-  static void Convert(Int *x,Int *d,uint32_t type,uint64_t *h,int128_t *X,int128_t *D);
+  static void Convert(Int *x,Int *d,uint32_t type,uint64_t *h,int128_t *X,int192_t *D);
   static int MergeH(uint32_t h,FILE* f1,FILE* f2,FILE* fd,uint32_t *nbDP,uint32_t* duplicate,
                     Int* d1,uint32_t* k1,Int* d2,uint32_t* k2);
-  static void CalcDistAndType(int128_t d,Int* kDist,uint32_t* kType);
+  static void CalcDistAndType(int192_t d,Int* kDist,uint32_t* kType);
 
 private:
 
-  ENTRY *CreateEntry(int128_t *x,int128_t *d);
+  ENTRY *CreateEntry(int128_t *x,int192_t *d);
   static int compare(int128_t *i1,int128_t *i2);
   std::string GetStr(int128_t *i);
 

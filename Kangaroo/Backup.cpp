@@ -200,6 +200,26 @@ bool Kangaroo::LoadWork(string &fileName) {
   loadedWorkVersion = version;
   loadedWorkHasSymClass = (loadedWorkVersion >= 1);
 
+#ifdef USE_SYMMETRY
+  if(loadedWorkVersion < 2) {
+    ::printf("LoadWork: ERROR - workfile version %d uses 128-bit distance (incompatible with 192-bit format).\n",
+             loadedWorkVersion);
+    ::printf("LoadWork: Please discard this workfile and start a fresh run.\n");
+    ::fclose(fRead);
+    fRead = NULL;
+    return false;
+  }
+#else
+  if(loadedWorkVersion < 1) {
+    ::printf("LoadWork: WARNING - legacy workfile version %d (no 192-bit distance upgrade).\n",
+             loadedWorkVersion);
+    ::printf("LoadWork: HashTable format may be incompatible. Discarding old workfile.\n");
+    ::fclose(fRead);
+    fRead = NULL;
+    return false;
+  }
+#endif
+
   // Read number of walk
   fread(&nbLoadedWalk,sizeof(uint64_t),1,fRead);
 
@@ -252,7 +272,7 @@ void Kangaroo::FetchWalks(uint64_t nbWalk,Int *x,Int *y,Int *d,uint64_t *symClas
 
 }
 
-void Kangaroo::FetchWalks(uint64_t nbWalk,std::vector<int128_t>& kangs,Int* x,Int* y,Int* d,uint64_t *symClass) {
+void Kangaroo::FetchWalks(uint64_t nbWalk,std::vector<int192_t>& kangs,Int* x,Int* y,Int* d,uint64_t *symClass) {
 
   uint64_t n = 0;
 
@@ -261,8 +281,10 @@ void Kangaroo::FetchWalks(uint64_t nbWalk,std::vector<int128_t>& kangs,Int* x,In
   if(avail > 0) {
 
     vector<Int> dists;
+    vector<uint32_t> types;
     vector<Point> Sp;
     dists.reserve(avail);
+    types.reserve(avail);
     Sp.reserve(avail);
     Point Z;
     Z.Clear();
@@ -273,6 +295,7 @@ void Kangaroo::FetchWalks(uint64_t nbWalk,std::vector<int128_t>& kangs,Int* x,In
       uint32_t type;
       HashTable::CalcDistAndType(kangs[n],&dist,&type);
       dists.push_back(dist);
+      types.push_back(type);
 
     }
 
@@ -280,7 +303,7 @@ void Kangaroo::FetchWalks(uint64_t nbWalk,std::vector<int128_t>& kangs,Int* x,In
 
     for(n = 0; n < avail; n++) {
 
-      if(n % 2 == TAME) {
+      if(types[n] == TAME) {
         Sp.push_back(Z);
       }
       else {
@@ -321,7 +344,7 @@ void Kangaroo::FectchKangaroos(TH_PARAM *threads) {
   double sFetch = Timer::get_tick();
 
   // From server
-  vector<int128_t> kangs;
+  vector<int192_t> kangs;
   if(saveKangarooByServer) {
     ::printf("FectchKangaroosFromServer");
     if(!GetKangaroosFromServer(workFile,kangs))
@@ -427,11 +450,12 @@ bool Kangaroo::SaveHeader(string fileName,FILE* f,int type,uint64_t totalCount,d
 
   // Header
   uint32_t head = type;
-  uint32_t version = 0;
-#ifdef USE_SYMMETRY
-  if(saveKangaroo) {
-    version = 1;
-  }
+  // Version 2: 192-bit distance format (ENTRY 40 bytes, kangaroo buffer KSIZE=12)
+  // Version 1: 128-bit distance with symClass
+  // Version 0: legacy 128-bit distance without symClass
+  uint32_t version = 2;
+#ifndef USE_SYMMETRY
+  version = 1; // non-symmetry path bumped to 1 to mark 192-bit distance upgrade
 #endif
   if(::fwrite(&head,sizeof(uint32_t),1,f) != 1) {
     ::printf("SaveHeader: Cannot write to %s\n",fileName.c_str());
@@ -557,14 +581,14 @@ void Kangaroo::SaveWork(uint64_t totalCount,double totalTime,TH_PARAM *threads,i
     if(saveKangarooByServer) {
 
       ::printf("\nSaveWork (Kangaroo->Server): %s",fileName.c_str());
-      vector<int128_t> kangs;
+      vector<int192_t> kangs;
       for(int i = 0; i < nbThread; i++)
         totalWalk += threads[i].nbKangaroo;
       kangs.reserve(totalWalk);
 
       for(int i = 0; i < nbThread; i++) {
         int128_t X;
-        int128_t D;
+        int192_t D;
         uint64_t h;
         for(uint64_t n = 0; n < threads[i].nbKangaroo; n++) {
           HashTable::Convert(&threads[i].px[n],&threads[i].distance[n],n%2,&h,&X,&D);
@@ -572,7 +596,7 @@ void Kangaroo::SaveWork(uint64_t totalCount,double totalTime,TH_PARAM *threads,i
         }
       }
       SendKangaroosToServer(fileName,kangs);
-      size = kangs.size()*16 + 16;
+      size = kangs.size()*sizeof(int192_t) + 16;
       goto end;
 
     } else {

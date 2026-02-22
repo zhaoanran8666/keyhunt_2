@@ -38,6 +38,13 @@ static string Hex128(const int128_t &v) {
   return string(out);
 }
 
+static string Hex192(const int192_t &v) {
+  char out[49];
+  ::snprintf(out,sizeof(out),"%016" PRIX64 "%016" PRIX64 "%016" PRIX64,
+             v.i64[2],v.i64[1],v.i64[0]);
+  return string(out);
+}
+
 static const char *StateCacheModeName(int mode) {
   switch(mode) {
   case 0:
@@ -329,9 +336,9 @@ bool Kangaroo::CollisionCheck(Int* d1,uint32_t type1,Int* d2,uint32_t type2) {
           ::printf("UnexpectedCollisionDiag: xExisting=%s xIncoming=%s\n",
                    Hex128(hashTable.kXExisting).c_str(),
                    Hex128(hashTable.kXIncoming).c_str());
-          ::printf("UnexpectedCollisionDiag: dExisting(raw128)=%s dIncoming(raw128)=%s\n",
-                   Hex128(hashTable.kDExisting).c_str(),
-                   Hex128(hashTable.kDIncoming).c_str());
+          ::printf("UnexpectedCollisionDiag: dExisting(raw192)=%s dIncoming(raw192)=%s\n",
+                   Hex192(hashTable.kDExisting).c_str(),
+                   Hex192(hashTable.kDIncoming).c_str());
         } else {
           ::printf("UnexpectedCollisionDiag: raw collision payload unavailable\n");
         }
@@ -359,7 +366,7 @@ bool Kangaroo::AddToTable(Int *pos,Int *dist,uint32_t kType) {
 
 }
 
-bool Kangaroo::AddToTable(uint64_t h,int128_t *x,int128_t *d) {
+bool Kangaroo::AddToTable(uint64_t h,int128_t *x,int192_t *d) {
 
   int addStatus = hashTable.Add(h,x,d);
   if(addStatus== ADD_COLLISION) {
@@ -1026,6 +1033,13 @@ void Kangaroo::InitRange() {
   rangeWidthDiv4.ShiftR(1);
   rangeWidthDiv8.Set(&rangeWidthDiv4);
   rangeWidthDiv8.ShiftR(1);
+
+#ifdef USE_SYMMETRY
+  if(rangePower - 1 > 190) {
+    ::printf("FATAL: rangePower=%d exceeds 192-bit distance limit (max 191). Aborting.\n", rangePower);
+    exit(1);
+  }
+#endif
 
 }
 

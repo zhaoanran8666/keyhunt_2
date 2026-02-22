@@ -20,6 +20,7 @@
 #include "SECPK1/IntGroup.h"
 #include "Timer.h"
 #include <string.h>
+#include <inttypes.h>
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <algorithm>
@@ -29,6 +30,74 @@
 #endif
 
 using namespace std;
+
+static bool CheckDistEncodeDecodeCase(int caseId,const char *signName,uint32_t type,const Int &distIn) {
+
+  Int x;
+  x.SetInt32(0);
+  x.bits64[0] = 0x1122334455667788ULL;
+  x.bits64[1] = 0x99AABBCCDDEEFF00ULL;
+  x.bits64[2] = 0x0123456789ABCDEFULL;
+
+  Int dist(distIn);
+  int128_t X;
+  int192_t D;
+  uint64_t h;
+  HashTable::Convert(&x,&dist,type,&h,&X,&D);
+
+  Int distOut;
+  uint32_t typeOut;
+  HashTable::CalcDistAndType(D,&distOut,&typeOut);
+
+  bool ok = (typeOut == type) && distOut.IsEqual(&dist);
+  if(!ok) {
+    ::printf("\nDist192 self-test mismatch [case=%d sign=%s type=%u]\n",caseId,signName,type);
+    ::printf("In : %s\n",dist.GetBase16().c_str());
+    ::printf("Out: %s\n",distOut.GetBase16().c_str());
+    ::printf("Raw: %016" PRIX64 "%016" PRIX64 "%016" PRIX64 "\n",
+             D.i64[2],D.i64[1],D.i64[0]);
+  }
+  return ok;
+
+}
+
+static bool RunDist192SelfTest() {
+
+  Int mags[3];
+
+  mags[0].SetInt32(0);
+  mags[0].bits64[0] = 0x123456789ABCDEF0ULL;
+
+  mags[1].SetInt32(0);
+  mags[1].bits64[0] = 0xFEDCBA9876543210ULL;
+  mags[1].bits64[1] = 0x0123456789ABCDEFULL;
+  mags[1].bits64[2] = 0x0011223344556677ULL;
+
+  mags[2].SetInt32(0);
+  mags[2].bits64[0] = 0xFFFFFFFFFFFFFFFFULL;
+  mags[2].bits64[1] = 0xFFFFFFFFFFFFFFFFULL;
+  mags[2].bits64[2] = 0x3FFFFFFFFFFFFFFFULL;
+
+  bool ok = true;
+
+  for(int i = 0; i < 3; i++) {
+
+    Int pos;
+    pos.Set(&mags[i]);
+    Int neg;
+    neg.Set(&mags[i]);
+    neg.ModNegK1order();
+
+    ok = CheckDistEncodeDecodeCase(i,"pos",TAME,pos) && ok;
+    ok = CheckDistEncodeDecodeCase(i,"pos",WILD,pos) && ok;
+    ok = CheckDistEncodeDecodeCase(i,"neg",TAME,neg) && ok;
+    ok = CheckDistEncodeDecodeCase(i,"neg",WILD,neg) && ok;
+
+  }
+
+  return ok;
+
+}
 
 uint32_t Kangaroo::CheckHash(uint32_t h,uint32_t nbItem,HashTable* hT,FILE* f) {
 
@@ -57,7 +126,7 @@ uint32_t Kangaroo::CheckHash(uint32_t h,uint32_t nbItem,HashTable* hT,FILE* f) {
     items = (ENTRY*)malloc(nbItem * sizeof(ENTRY));
 
     for(uint32_t i = 0; i < nbItem; i++) {
-      ::fread(items+i,32,1,f);
+      ::fread(items+i,sizeof(ENTRY),1,f);
       e = items + i;
       Int dist;
       uint32_t kType;
@@ -465,6 +534,13 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     ::printf("%s\n",pts1[i].toString().c_str());
     ::printf("%s\n",pts2[i].toString().c_str());
   }
+
+  ::printf("Dist192 self-test...");
+  if(!RunDist192SelfTest()) {
+    ::printf(" failed\n");
+    return;
+  }
+  ::printf(" ok\n");
 
   /*
   // Check jump table

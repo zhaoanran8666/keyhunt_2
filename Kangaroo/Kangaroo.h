@@ -97,7 +97,7 @@ typedef struct {
   uint32_t kIdx;
   uint32_t h;
   int128_t x;
-  int128_t d;
+  int192_t d;
 
 } DP;
 
@@ -166,7 +166,7 @@ private:
   void SetDP(int size);
   void CreateHerd(int nbKangaroo,Int *px, Int *py, Int *d, int firstType,bool lock=true);
   void CreateJumpTable();
-  bool AddToTable(uint64_t h,int128_t *x,int128_t *d);
+  bool AddToTable(uint64_t h,int128_t *x,int192_t *d);
   bool AddToTable(Int *pos,Int *dist,uint32_t kType);
   bool SendToServer(std::vector<ITEM> &dp,uint32_t threadId,uint32_t gpuId);
   bool CheckKey(Int d1,Int d2,uint8_t type);
@@ -182,7 +182,7 @@ private:
   void SaveWork(uint64_t totalCount,double totalTime,TH_PARAM *threads,int nbThread);
   void SaveServerWork();
   void FetchWalks(uint64_t nbWalk,Int *x,Int *y,Int *d,uint64_t *symClass = NULL);
-  void FetchWalks(uint64_t nbWalk,std::vector<int128_t>& kangs,Int* x,Int* y,Int* d,uint64_t *symClass = NULL);
+  void FetchWalks(uint64_t nbWalk,std::vector<int192_t>& kangs,Int* x,Int* y,Int* d,uint64_t *symClass = NULL);
   void FectchKangaroos(TH_PARAM *threads);
   FILE *ReadHeader(std::string fileName,uint32_t *version,int type);
   bool  SaveHeader(std::string fileName,FILE* f,int type,uint64_t totalCount,double totalTime);
@@ -205,8 +205,8 @@ private:
   void InitSocket();
   void WaitForServer();
   int32_t GetServerStatus();
-  bool SendKangaroosToServer(std::string& fileName,std::vector<int128_t>& kangs);
-  bool GetKangaroosFromServer(std::string& fileName,std::vector<int128_t>& kangs);
+  bool SendKangaroosToServer(std::string& fileName,std::vector<int192_t>& kangs);
+  bool GetKangaroosFromServer(std::string& fileName,std::vector<int192_t>& kangs);
 
 #ifdef WIN64
   HANDLE ghMutex;

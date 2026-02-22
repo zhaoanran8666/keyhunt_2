@@ -1159,7 +1159,7 @@ bool GPUEngine::GetKangarooSymClass(uint64_t kIdx,uint64_t *symClass) {
   uint64_t gSize = (uint64_t)KSIZE * (uint64_t)groupSize;
   uint64_t strideSize = (uint64_t)nbThreadPerGroup * (uint64_t)KSIZE;
   uint64_t blockSize = (uint64_t)nbThreadPerGroup * gSize;
-  uint64_t idx = b * blockSize + g * strideSize + t + 10ull * (uint64_t)nbThreadPerGroup;
+  uint64_t idx = b * blockSize + g * strideSize + t + 11ull * (uint64_t)nbThreadPerGroup;
   *symClass = inputKangaroo[idx] & 1ULL;
   return true;
 #else
@@ -1210,12 +1210,15 @@ void GPUEngine::SetKangaroos(Int *px, Int *py, Int *d, uint64_t *symClass) {
 #ifdef USE_SYMMETRY
         uint64_t gpuD0;
         uint64_t gpuD1;
-        EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1);
-        inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup] = gpuD0;
-        inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup] = gpuD1;
+        uint64_t gpuD2;
+        EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1,&gpuD2);
+        inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup]  = gpuD0;
+        inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup]  = gpuD1;
+        inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = gpuD2;
 #else
-        inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup] = dOff.bits64[0];
-        inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup] = dOff.bits64[1];
+        inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup]  = dOff.bits64[0];
+        inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup]  = dOff.bits64[1];
+        inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = dOff.bits64[2];
 #endif
 
 #ifdef USE_SYMMETRY
@@ -1224,7 +1227,7 @@ void GPUEngine::SetKangaroos(Int *px, Int *py, Int *d, uint64_t *symClass) {
           sc = symClass[idx] & 1ULL;
         }
         // Metal symmetry kernels persist per-walker symmetry class (0/1).
-        inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = sc;
+        inputKangarooPinned[g * strideSize + t + 11 * nbThreadPerGroup] = sc;
 #endif
 
         idx++;
@@ -1417,10 +1420,13 @@ void GPUEngine::GetKangaroos(Int *px, Int *py, Int *d, uint64_t *symClass) {
         dOff.SetInt32(0);
 #ifdef USE_SYMMETRY
         DecodeGpuDistanceSym(inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup],
-                             inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup],&dOff);
+                             inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup],
+                             inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup],
+                             &dOff);
 #else
         dOff.bits64[0] = inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup];
         dOff.bits64[1] = inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup];
+        dOff.bits64[2] = inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup];
 #endif
 #ifndef USE_SYMMETRY
         if(idx % 2 == WILD) {
@@ -1432,7 +1438,7 @@ void GPUEngine::GetKangaroos(Int *px, Int *py, Int *d, uint64_t *symClass) {
 #ifdef USE_SYMMETRY
         if(symClass != nullptr) {
           symClass[idx] =
-              inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] & 1ULL;
+              inputKangarooPinned[g * strideSize + t + 11 * nbThreadPerGroup] & 1ULL;
         }
 #endif
 
@@ -1488,16 +1494,19 @@ void GPUEngine::SetKangaroo(uint64_t kIdx, Int *px, Int *py, Int *d, uint64_t sy
 #ifdef USE_SYMMETRY
   uint64_t gpuD0;
   uint64_t gpuD1;
-  EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1);
-  inputKangaroo[b * blockSize + g * strideSize + t + 8 * nbThreadPerGroup] = gpuD0;
-  inputKangaroo[b * blockSize + g * strideSize + t + 9 * nbThreadPerGroup] = gpuD1;
+  uint64_t gpuD2;
+  EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1,&gpuD2);
+  inputKangaroo[b * blockSize + g * strideSize + t + 8 * nbThreadPerGroup]  = gpuD0;
+  inputKangaroo[b * blockSize + g * strideSize + t + 9 * nbThreadPerGroup]  = gpuD1;
+  inputKangaroo[b * blockSize + g * strideSize + t + 10 * nbThreadPerGroup] = gpuD2;
 #else
-  inputKangaroo[b * blockSize + g * strideSize + t + 8 * nbThreadPerGroup] = dOff.bits64[0];
-  inputKangaroo[b * blockSize + g * strideSize + t + 9 * nbThreadPerGroup] = dOff.bits64[1];
+  inputKangaroo[b * blockSize + g * strideSize + t + 8 * nbThreadPerGroup]  = dOff.bits64[0];
+  inputKangaroo[b * blockSize + g * strideSize + t + 9 * nbThreadPerGroup]  = dOff.bits64[1];
+  inputKangaroo[b * blockSize + g * strideSize + t + 10 * nbThreadPerGroup] = dOff.bits64[2];
 #endif
 
 #ifdef USE_SYMMETRY
-  inputKangaroo[b * blockSize + g * strideSize + t + 10 * nbThreadPerGroup] = symClass & 1ULL;
+  inputKangaroo[b * blockSize + g * strideSize + t + 11 * nbThreadPerGroup] = symClass & 1ULL;
 #endif
 }
 
@@ -1708,7 +1717,7 @@ bool GPUEngine::Launch(std::vector<ITEM> &hashFound, bool spinWait) {
     uint32_t *itemPtr = doneOutput + (i * ITEM_SIZE32 + 1);
     ITEM it;
 
-    it.kIdx = *((uint64_t *)(itemPtr + 12));
+    it.kIdx = *((uint64_t *)(itemPtr + 14));
 
     uint64_t *x = (uint64_t *)itemPtr;
     it.x.bits64[0] = x[0];
@@ -1719,11 +1728,11 @@ bool GPUEngine::Launch(std::vector<ITEM> &hashFound, bool spinWait) {
 
     uint64_t *d = (uint64_t *)(itemPtr + 8);
 #ifdef USE_SYMMETRY
-    DecodeGpuDistanceSym(d[0],d[1],&it.d);
+    DecodeGpuDistanceSym(d[0],d[1],d[2],&it.d);
 #else
     it.d.bits64[0] = d[0];
     it.d.bits64[1] = d[1];
-    it.d.bits64[2] = 0;
+    it.d.bits64[2] = d[2];
     it.d.bits64[3] = 0;
     it.d.bits64[4] = 0;
 #endif
