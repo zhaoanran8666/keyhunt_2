@@ -34,7 +34,7 @@
 
 __global__ void comp_kangaroos(uint64_t *kangaroos,uint32_t maxFound,uint32_t *found,uint64_t dpMask) {
 
-  int xPtr = (blockIdx.x*blockDim.x*GPU_GRP_SIZE) * KSIZE; // x[4] , y[4] , d[2], lastJump
+  int xPtr = (blockIdx.x * blockDim.x * GPU_GRP_SIZE) * KSIZE; // x[4], y[4], d[3], symClass
   ComputeKangaroos(kangaroos + xPtr,maxFound,found,dpMask);
 
 }
@@ -400,12 +400,48 @@ int GPUEngine::GetStateCacheMode() const {
 }
 
 bool GPUEngine::GetKangarooSymClass(uint64_t kIdx,uint64_t *symClass) {
+#ifdef USE_SYMMETRY
+  if(symClass == NULL || !initialised || nbThreadPerGroup <= 0) {
+    return false;
+  }
+
+  uint64_t walkersPerBlock = (uint64_t)nbThreadPerGroup * (uint64_t)GPU_GRP_SIZE;
+  if(walkersPerBlock == 0) {
+    return false;
+  }
+  uint64_t nbBlock = (uint64_t)nbThread / (uint64_t)nbThreadPerGroup;
+  uint64_t b = kIdx / walkersPerBlock;
+  uint64_t rem = kIdx % walkersPerBlock;
+  uint64_t g = rem / (uint64_t)nbThreadPerGroup;
+  uint64_t t = rem % (uint64_t)nbThreadPerGroup;
+  if(b >= nbBlock || g >= (uint64_t)GPU_GRP_SIZE) {
+    return false;
+  }
+
+  uint64_t gSize = (uint64_t)KSIZE * (uint64_t)GPU_GRP_SIZE;
+  uint64_t strideSize = (uint64_t)nbThreadPerGroup * (uint64_t)KSIZE;
+  uint64_t blockSize = (uint64_t)nbThreadPerGroup * gSize;
+  uint64_t idx = b * blockSize + g * strideSize + t + 11ULL * (uint64_t)nbThreadPerGroup;
+
+  uint64_t raw = 0ULL;
+  cudaError_t err = cudaMemcpy(&raw,inputKangaroo + idx,sizeof(uint64_t),cudaMemcpyDeviceToHost);
+  if(err != cudaSuccess) {
+    return false;
+  }
+  *symClass = raw & 1ULL;
+  return true;
+#else
   (void)kIdx;
   (void)symClass;
   return false;
+#endif
 }
 
 void GPUEngine::SetKangaroos(Int *px,Int *py,Int *d) {
+  SetKangaroos(px,py,d,NULL);
+}
+
+void GPUEngine::SetKangaroos(Int *px,Int *py,Int *d,uint64_t *symClass) {
 
   // Sets the kangaroos of each thread
   int gSize = KSIZE * GPU_GRP_SIZE;
@@ -440,17 +476,23 @@ void GPUEngine::SetKangaroos(Int *px,Int *py,Int *d) {
 #ifdef USE_SYMMETRY
         uint64_t gpuD0;
         uint64_t gpuD1;
-        EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1);
+        uint64_t gpuD2;
+        EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1,&gpuD2);
         inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup] = gpuD0;
         inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup] = gpuD1;
+        inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = gpuD2;
 #else
         inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup] = dOff.bits64[0];
         inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup] = dOff.bits64[1];
+        inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = dOff.bits64[2];
 #endif
 
 #ifdef USE_SYMMETRY
-        // Last jump
-        inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = (uint64_t)NB_JUMP;
+        uint64_t sc = 0ULL;
+        if(symClass != NULL) {
+          sc = symClass[idx] & 1ULL;
+        }
+        inputKangarooPinned[g * strideSize + t + 11 * nbThreadPerGroup] = sc;
 #endif
 
         idx++;
@@ -471,6 +513,10 @@ void GPUEngine::SetKangaroos(Int *px,Int *py,Int *d) {
 }
 
 void GPUEngine::GetKangaroos(Int *px,Int *py,Int *d) {
+  GetKangaroos(px,py,d,NULL);
+}
+
+void GPUEngine::GetKangaroos(Int *px,Int *py,Int *d,uint64_t *symClass) {
 
   if(inputKangarooPinned==NULL ) {
     printf("GPUEngine: GetKangaroos: Cannot retreive kangaroos, mem has been freed\n");
@@ -512,15 +558,23 @@ void GPUEngine::GetKangaroos(Int *px,Int *py,Int *d) {
         dOff.SetInt32(0);
 #ifdef USE_SYMMETRY
         DecodeGpuDistanceSym(inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup],
-                             inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup],&dOff);
+                             inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup],
+                             inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup],&dOff);
 #else
         dOff.bits64[0] = inputKangarooPinned[g * strideSize + t + 8 * nbThreadPerGroup];
         dOff.bits64[1] = inputKangarooPinned[g * strideSize + t + 9 * nbThreadPerGroup];
+        dOff.bits64[2] = inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup];
 #endif
 #ifndef USE_SYMMETRY
         if(idx % 2 == WILD) dOff.ModSubK1order(&wildOffset);
 #endif
         d[idx].Set(&dOff);
+
+#ifdef USE_SYMMETRY
+        if(symClass != NULL) {
+          symClass[idx] = inputKangarooPinned[g * strideSize + t + 11 * nbThreadPerGroup] & 1ULL;
+        }
+#endif
 
         idx++;
       }
@@ -536,6 +590,10 @@ void GPUEngine::GetKangaroos(Int *px,Int *py,Int *d) {
 }
 
 void GPUEngine::SetKangaroo(uint64_t kIdx,Int *px,Int *py,Int *d) {
+  SetKangaroo(kIdx,px,py,d,0ULL);
+}
+
+void GPUEngine::SetKangaroo(uint64_t kIdx,Int *px,Int *py,Int *d,uint64_t symClass) {
 
   int gSize = KSIZE * GPU_GRP_SIZE;
   int strideSize = nbThreadPerGroup * KSIZE;
@@ -574,21 +632,25 @@ void GPUEngine::SetKangaroo(uint64_t kIdx,Int *px,Int *py,Int *d) {
 #ifdef USE_SYMMETRY
   uint64_t gpuD0;
   uint64_t gpuD1;
-  EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1);
+  uint64_t gpuD2;
+  EncodeGpuDistanceSym(&dOff,&gpuD0,&gpuD1,&gpuD2);
   inputKangarooPinned[0] = gpuD0;
   cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 8 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
   inputKangarooPinned[0] = gpuD1;
+  cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 9 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
+  inputKangarooPinned[0] = gpuD2;
 #else
   inputKangarooPinned[0] = dOff.bits64[0];
   cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 8 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
   inputKangarooPinned[0] = dOff.bits64[1];
-#endif
   cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 9 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
+  inputKangarooPinned[0] = dOff.bits64[2];
+#endif
+  cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 10 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
 
 #ifdef USE_SYMMETRY
-  // Last jump
-  inputKangarooPinned[0] = (uint64_t)NB_JUMP;
-  cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 10 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
+  inputKangarooPinned[0] = symClass & 1ULL;
+  cudaMemcpy(inputKangaroo + (b * blockSize + g * strideSize + t + 11 * nbThreadPerGroup),inputKangarooPinned,8,cudaMemcpyHostToDevice);
 #endif
 
 }
@@ -710,7 +772,7 @@ bool GPUEngine::Launch(std::vector<ITEM> &hashFound,bool spinWait) {
     uint32_t *itemPtr = outputItemPinned + (i*ITEM_SIZE32 + 1);
     ITEM it;
 
-    it.kIdx = *((uint64_t*)(itemPtr + 12));
+    it.kIdx = *((uint64_t*)(itemPtr + 14));
 
     uint64_t *x = (uint64_t *)itemPtr;
     it.x.bits64[0] = x[0];
@@ -721,11 +783,11 @@ bool GPUEngine::Launch(std::vector<ITEM> &hashFound,bool spinWait) {
 
     uint64_t *d = (uint64_t *)(itemPtr + 8);
 #ifdef USE_SYMMETRY
-    DecodeGpuDistanceSym(d[0],d[1],&it.d);
+    DecodeGpuDistanceSym(d[0],d[1],d[2],&it.d);
 #else
     it.d.bits64[0] = d[0];
     it.d.bits64[1] = d[1];
-    it.d.bits64[2] = 0;
+    it.d.bits64[2] = d[2];
     it.d.bits64[3] = 0;
     it.d.bits64[4] = 0;
 #endif

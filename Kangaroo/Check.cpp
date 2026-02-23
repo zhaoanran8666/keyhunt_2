@@ -597,11 +597,9 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     Int *cpuPx = new Int[nb];
     Int *cpuPy = new Int[nb];
     Int *cpuD = new Int[nb];
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
     vector<uint64_t> symClass((size_t)nb,0ULL);
     vector<uint64_t> gpuSymClass((size_t)nb,0ULL);
-#elif defined(USE_SYMMETRY)
-    uint64_t *lastJump = new uint64_t[nb];
 #endif
     vector<ITEM> gpuFound;
 
@@ -610,23 +608,18 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     keyToSearch = secp->ComputePublicKey(&pk);
 
     CreateHerd(nb,cpuPx,cpuPy,cpuD,TAME);
-#if defined(USE_SYMMETRY) && !(defined(WITHMETAL))
-    for(int i = 0; i < nb; i++) lastJump[i] = NB_JUMP;
-#endif
 
     CreateJumpTable();
 
     h.SetParams(dMask,jumpDistance,jumpPointx,jumpPointy);
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
     Int wildOffsetZero;
     wildOffsetZero.SetInt32(0);
     h.SetWildOffset(&wildOffsetZero);
-#elif defined(USE_SYMMETRY)
-    h.SetWildOffset(&rangeWidthDiv4);
 #else
     h.SetWildOffset(&rangeWidthDiv2);
 #endif
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
     h.SetKangaroos(cpuPx,cpuPy,cpuD,symClass.data());
 #else
     h.SetKangaroos(cpuPx,cpuPy,cpuD);
@@ -635,7 +628,7 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     // Test single
     uint64_t r = rndl() % nb;
     CreateHerd(1,&cpuPx[r],&cpuPy[r],&cpuD[r],r % 2);
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
     symClass[(size_t)r] = 0ULL;
     h.SetKangaroo(r,&cpuPx[r],&cpuPy[r],&cpuD[r],symClass[(size_t)r]);
 #else
@@ -643,7 +636,7 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
 #endif
 
     h.Launch(gpuFound);
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
     h.GetKangaroos(gpuPx,gpuPy,gpuD,gpuSymClass.data());
 #else
     h.GetKangaroos(gpuPx,gpuPy,gpuD);
@@ -656,16 +649,29 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     _1.SetInt32(1);
     for(int r = 0; r < h.GetRunCount(); r++) {
       for(int i = 0; i<nb; i++) {
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
         uint64_t jmp =
             (cpuPx[i].bits64[0] % (NB_JUMP / 2)) + (NB_JUMP / 2) * (symClass[(size_t)i] & 1ULL);
 #else
         uint64_t jmp = (cpuPx[i].bits64[0] % NB_JUMP);
+#endif
+
+        // Match GPU kernel fallback: if denominator is zero (same X as jump point),
+        // switch to next jump in the same symmetry class; if still zero, skip this step.
+        if(cpuPx[i].IsEqual(&jumpPointx[jmp])) {
 #ifdef USE_SYMMETRY
-        // Limit cycle
-        if(jmp == lastJump[i]) jmp = (lastJump[i] + 1) % NB_JUMP;
+          uint64_t half = (NB_JUMP / 2);
+          uint64_t base = half * (symClass[(size_t)i] & 1ULL);
+          uint64_t local = jmp - base;
+          uint64_t jAlt = base + ((local + 1ULL) % half);
+#else
+          uint64_t jAlt = (jmp + 1ULL) % NB_JUMP;
 #endif
-#endif
+          if(cpuPx[i].IsEqual(&jumpPointx[jAlt])) {
+            continue;
+          }
+          jmp = jAlt;
+        }
 
         Point J(&jumpPointx[jmp],&jumpPointy[jmp],&_1);
         Point P2(&cpuPx[i],&cpuPy[i],&_1);
@@ -679,13 +685,8 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
         // Equivalence symmetry class switch
         if(cpuPy[i].ModPositiveK1()) {
           cpuD[i].ModNegK1order();
-#if defined(WITHMETAL)
           symClass[(size_t)i] ^= 1ULL;
-#endif
         }
-#if !(defined(WITHMETAL))
-        lastJump[i] = jmp;
-#endif
 #endif
 
         if(IsDP(cpuPx[i].bits64[3])) {
@@ -738,7 +739,7 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     for(int i = 0; i<nb; i++) {
       bool okGpu = gpuPx[i].IsEqual(&cpuPx[i]) && gpuPy[i].IsEqual(&cpuPy[i]) &&
                    gpuD[i].IsEqual(&cpuD[i]);
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
       okGpu = okGpu && ((gpuSymClass[(size_t)i] & 1ULL) == (symClass[(size_t)i] & 1ULL));
 #endif
       if(!okGpu) {
@@ -750,7 +751,7 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
           ::printf("GPU Kx=%s\n",gpuPx[i].GetBase16().c_str());
           ::printf("GPU Ky=%s\n",gpuPy[i].GetBase16().c_str());
           ::printf("GPU Kd=%s\n",gpuD[i].GetBase16().c_str());
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
           ::printf("CPU Sc=%" PRIu64 "\n",symClass[(size_t)i] & 1ULL);
           ::printf("GPU Sc=%" PRIu64 "\n",gpuSymClass[(size_t)i] & 1ULL);
 #endif

@@ -94,11 +94,9 @@ public:
   void SetKangaroos(Int *px,Int *py,Int *d);
   void GetKangaroos(Int *px,Int *py,Int *d);
   void SetKangaroo(uint64_t kIdx,Int *px,Int *py,Int *d);
-#ifdef WITHMETAL
   void SetKangaroos(Int *px,Int *py,Int *d,uint64_t *symClass);
   void GetKangaroos(Int *px,Int *py,Int *d,uint64_t *symClass);
   void SetKangaroo(uint64_t kIdx,Int *px,Int *py,Int *d,uint64_t symClass);
-#endif
   bool Launch(std::vector<ITEM> &hashFound,bool spinWait = false);
   void SetWildOffset(Int *offset);
   int GetNbThread();

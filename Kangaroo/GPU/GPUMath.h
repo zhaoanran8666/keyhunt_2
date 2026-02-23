@@ -193,7 +193,7 @@ out[pos*ITEM_SIZE32 + 16] = ((uint32_t *)idx)[1]; \
 // ---------------------------------------------------------------------------------------
 
 #ifdef USE_SYMMETRY
-__device__ void LoadKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3],uint64_t *jumps) {
+__device__ void LoadKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3],uint64_t *symClass) {
 #else
 __device__ void LoadKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3]) {
 #endif
@@ -222,7 +222,7 @@ __device__ void LoadKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t
     d64[2] = (a)[IDX + 10 * blockDim.x + stride];
 
 #ifdef USE_SYMMETRY
-    jumps[g] = (a)[IDX + 11 * blockDim.x + stride];
+    symClass[g] = (a)[IDX + 11 * blockDim.x + stride] & 1ULL;
 #endif
   }
 
@@ -276,7 +276,7 @@ __device__ void LoadKangaroo(uint64_t* a,uint32_t stride,uint64_t px[4]) {
 // ---------------------------------------------------------------------------------------
 
 #ifdef USE_SYMMETRY
-__device__ void StoreKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3],uint64_t *jumps) {
+__device__ void StoreKangaroos(uint64_t *a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3],uint64_t *symClass) {
 #else
 __device__ void StoreKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_t py[GPU_GRP_SIZE][4],uint64_t dist[GPU_GRP_SIZE][3]) {
 #endif
@@ -304,7 +304,7 @@ __device__ void StoreKangaroos(uint64_t * a,uint64_t px[GPU_GRP_SIZE][4],uint64_
     (a)[IDX + 10 * blockDim.x + stride] = d64[2];
 
 #ifdef USE_SYMMETRY
-    (a)[IDX + 11 * blockDim.x + stride] = jumps[g];
+    (a)[IDX + 11 * blockDim.x + stride] = symClass[g] & 1ULL;
 #endif
   }
 

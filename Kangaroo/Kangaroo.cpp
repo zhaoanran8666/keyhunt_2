@@ -623,19 +623,17 @@ void Kangaroo::SolveKeyGPU(TH_PARAM *ph) {
     }
   }
 
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
-  // Metal symmetry path keeps signed distance directly; applying a constant
+#ifdef USE_SYMMETRY
+  // Symmetry path keeps signed distance directly; applying a constant
   // wild offset breaks sign-toggle equivalence during reflection.
   Int wildOffsetZero;
   wildOffsetZero.SetInt32(0);
   gpu->SetWildOffset(&wildOffsetZero);
-#elif defined(USE_SYMMETRY)
-  gpu->SetWildOffset(&rangeWidthDiv4);
 #else
   gpu->SetWildOffset(&rangeWidthDiv2);
 #endif
   gpu->SetParams(dMask,jumpDistance,jumpPointx,jumpPointy);
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
   gpu->SetKangaroos(ph->px,ph->py,ph->distance,ph->symClass);
 #else
   gpu->SetKangaroos(ph->px,ph->py,ph->distance);
@@ -705,7 +703,7 @@ void Kangaroo::SolveKeyGPU(TH_PARAM *ph) {
           lastAddGpuRunCount = gpu->GetRunCount();
 
           if(!AddToTable(&gpuFound[g].x,&gpuFound[g].d,kType)) {
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
             if(lastCollisionWasUnexpectedWrong && !unexpectedCollisionGpuDiagPrinted) {
               uint64_t symClass = 0ULL;
               bool hasSymClass = gpu->GetKangarooSymClass(gpuFound[g].kIdx,&symClass);
@@ -734,7 +732,7 @@ void Kangaroo::SolveKeyGPU(TH_PARAM *ph) {
             Int py;
             Int d;
             CreateHerd(1,&px,&py,&d,kType,false);
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
             gpu->SetKangaroo(gpuFound[g].kIdx,&px,&py,&d,0ULL);
 #else
             gpu->SetKangaroo(gpuFound[g].kIdx,&px,&py,&d);
@@ -757,7 +755,7 @@ void Kangaroo::SolveKeyGPU(TH_PARAM *ph) {
           ph->symClass = new uint64_t[ph->nbKangaroo];
         }
 #endif
-#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+#ifdef USE_SYMMETRY
         gpu->GetKangaroos(ph->px,ph->py,ph->distance,ph->symClass);
 #else
         gpu->GetKangaroos(ph->px,ph->py,ph->distance);
