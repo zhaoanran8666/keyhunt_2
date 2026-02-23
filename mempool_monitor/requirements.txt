@@ -1,0 +1,15 @@
+# Mempool 监控模块 Python 依赖
+# 安装: pip install -r mempool_monitor/requirements.txt
+
+# WebSocket 客户端 — 连接 mempool.space 实时 API
+websockets>=12.0
+
+# 异步 HTTP 客户端 — 用于 Blockstream REST API 轮询
+aiohttp>=3.9
+
+# 比特币交易构造与签名 — 用于自动交易广播
+bit>=0.8
+
+# 测试框架
+pytest>=7.0
+pytest-asyncio>=0.23
