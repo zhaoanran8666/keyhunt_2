@@ -155,7 +155,7 @@ unset KANGAROO_METAL_STATE_CACHE_MODE KANGAROO_METAL_NO_STATE_CACHE KANGAROO_MET
 KANGAROO_METAL_AUTO_MODE14_WARMUP=1 KANGAROO_METAL_AUTO_MODE14_ITERS=2 KANGAROO_METAL_AUTO_MODE14_MIN_GAIN_PCT=0 \
 KANGAROO_METAL_BLOCK_WAIT=1 KANGAROO_METAL_GRP_SIZE=128 KANGAROO_METAL_NB_RUN=2 KANGAROO_METAL_WAIT_TIMEOUT_MS=8000 \
 ./kangaroo -gpu -gpuId 0 -g 80,256 -d 43 -t 0 \
-  -w /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work -wi 60 -ws -wt 15000 \
+  -w /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work -wi 120 -ws -wt 15000 \
   -o /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_result.txt \
   /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135.txt
 
@@ -166,7 +166,7 @@ KANGAROO_METAL_AUTO_MODE14_WARMUP=1 KANGAROO_METAL_AUTO_MODE14_ITERS=2 KANGAROO_
 KANGAROO_METAL_BLOCK_WAIT=1 KANGAROO_METAL_GRP_SIZE=128 KANGAROO_METAL_NB_RUN=2 KANGAROO_METAL_WAIT_TIMEOUT_MS=8000 \
 ./kangaroo -gpu -gpuId 0 -g 80,256 -t 0 \
   -i /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work \
-  -w /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work -wi 600 -ws -wt 15000 \
+  -w /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work -wi 1800 -ws -wt 15000 \
   -o /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_result.txt \
   /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135.txt
 
