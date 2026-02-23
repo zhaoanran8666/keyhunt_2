@@ -597,7 +597,12 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     Int *cpuPx = new Int[nb];
     Int *cpuPy = new Int[nb];
     Int *cpuD = new Int[nb];
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+    vector<uint64_t> symClass((size_t)nb,0ULL);
+    vector<uint64_t> gpuSymClass((size_t)nb,0ULL);
+#elif defined(USE_SYMMETRY)
     uint64_t *lastJump = new uint64_t[nb];
+#endif
     vector<ITEM> gpuFound;
 
     Int pk;
@@ -605,7 +610,9 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     keyToSearch = secp->ComputePublicKey(&pk);
 
     CreateHerd(nb,cpuPx,cpuPy,cpuD,TAME);
-    for(int i=0;i<nb;i++) lastJump[i]=NB_JUMP;
+#if defined(USE_SYMMETRY) && !(defined(WITHMETAL))
+    for(int i = 0; i < nb; i++) lastJump[i] = NB_JUMP;
+#endif
 
     CreateJumpTable();
 
@@ -619,15 +626,28 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
 #else
     h.SetWildOffset(&rangeWidthDiv2);
 #endif
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+    h.SetKangaroos(cpuPx,cpuPy,cpuD,symClass.data());
+#else
     h.SetKangaroos(cpuPx,cpuPy,cpuD);
+#endif
 
     // Test single
     uint64_t r = rndl() % nb;
     CreateHerd(1,&cpuPx[r],&cpuPy[r],&cpuD[r],r % 2);
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+    symClass[(size_t)r] = 0ULL;
+    h.SetKangaroo(r,&cpuPx[r],&cpuPy[r],&cpuD[r],symClass[(size_t)r]);
+#else
     h.SetKangaroo(r,&cpuPx[r],&cpuPy[r],&cpuD[r]);
+#endif
 
     h.Launch(gpuFound);
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+    h.GetKangaroos(gpuPx,gpuPy,gpuD,gpuSymClass.data());
+#else
     h.GetKangaroos(gpuPx,gpuPy,gpuD);
+#endif
     h.Launch(gpuFound);
     ::printf("DP found: %d\n",(int)gpuFound.size());
 
@@ -636,11 +656,15 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
     _1.SetInt32(1);
     for(int r = 0; r < h.GetRunCount(); r++) {
       for(int i = 0; i<nb; i++) {
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+        uint64_t jmp =
+            (cpuPx[i].bits64[0] % (NB_JUMP / 2)) + (NB_JUMP / 2) * (symClass[(size_t)i] & 1ULL);
+#else
         uint64_t jmp = (cpuPx[i].bits64[0] % NB_JUMP);
-
 #ifdef USE_SYMMETRY
         // Limit cycle
         if(jmp == lastJump[i]) jmp = (lastJump[i] + 1) % NB_JUMP;
+#endif
 #endif
 
         Point J(&jumpPointx[jmp],&jumpPointy[jmp],&_1);
@@ -653,9 +677,15 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
 
 #ifdef USE_SYMMETRY
         // Equivalence symmetry class switch
-        if(cpuPy[i].ModPositiveK1())
+        if(cpuPy[i].ModPositiveK1()) {
           cpuD[i].ModNegK1order();
+#if defined(WITHMETAL)
+          symClass[(size_t)i] ^= 1ULL;
+#endif
+        }
+#if !(defined(WITHMETAL))
         lastJump[i] = jmp;
+#endif
 #endif
 
         if(IsDP(cpuPx[i].bits64[3])) {
@@ -674,12 +704,16 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
             gpuFound.erase(gpuFound.begin() + j);
           } else {
             ::printf("DP Mismatch:\n");
+            if(j < (int)gpuFound.size()) {
 #ifdef WIN64
-            ::printf("[%d] %s [0x%016I64X]\n",j,gpuFound[j].x.GetBase16().c_str(),gpuFound[j].kIdx);
+              ::printf("[%d] %s [0x%016I64X]\n",j,gpuFound[j].x.GetBase16().c_str(),gpuFound[j].kIdx);
 #else
-            ::printf("[%d] %s [0x%" PRIx64 "]\n",j,gpuFound[j].x.GetBase16().c_str(),gpuFound[j].kIdx);
+              ::printf("[%d] %s [0x%" PRIx64 "]\n",j,gpuFound[j].x.GetBase16().c_str(),gpuFound[j].kIdx);
 #endif
-            ::printf("[%d] %s \n",i,cpuPx[gpuFound[i].kIdx].GetBase16().c_str());
+            } else {
+              ::printf("[GPU] no candidate found (remaining=%d)\n",(int)gpuFound.size());
+            }
+            ::printf("[CPU idx=%d] %s\n",i,cpuPx[i].GetBase16().c_str());
             return;
           }
 
@@ -688,12 +722,25 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
       }
     }
 
+    if(!gpuFound.empty()) {
+      ::printf("DP Mismatch: GPU has %d unmatched item(s)\n",(int)gpuFound.size());
+#ifdef WIN64
+      ::printf("[0] %s [0x%016I64X]\n",gpuFound[0].x.GetBase16().c_str(),gpuFound[0].kIdx);
+#else
+      ::printf("[0] %s [0x%" PRIx64 "]\n",gpuFound[0].x.GetBase16().c_str(),gpuFound[0].kIdx);
+#endif
+      return;
+    }
+
     // Compare kangaroos
     int nbFault = 0;
     bool firstFault = true;
     for(int i = 0; i<nb; i++) {
       bool okGpu = gpuPx[i].IsEqual(&cpuPx[i]) && gpuPy[i].IsEqual(&cpuPy[i]) &&
                    gpuD[i].IsEqual(&cpuD[i]);
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+      okGpu = okGpu && ((gpuSymClass[(size_t)i] & 1ULL) == (symClass[(size_t)i] & 1ULL));
+#endif
       if(!okGpu) {
         nbFault++;
         if(firstFault) {
@@ -703,6 +750,10 @@ void Kangaroo::Check(std::vector<int> gpuId,std::vector<int> gridSize) {
           ::printf("GPU Kx=%s\n",gpuPx[i].GetBase16().c_str());
           ::printf("GPU Ky=%s\n",gpuPy[i].GetBase16().c_str());
           ::printf("GPU Kd=%s\n",gpuD[i].GetBase16().c_str());
+#if defined(WITHMETAL) && defined(USE_SYMMETRY)
+          ::printf("CPU Sc=%" PRIu64 "\n",symClass[(size_t)i] & 1ULL);
+          ::printf("GPU Sc=%" PRIu64 "\n",gpuSymClass[(size_t)i] & 1ULL);
+#endif
           firstFault = false;
         }
       }
