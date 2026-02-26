@@ -170,12 +170,16 @@ KANGAROO_METAL_BLOCK_WAIT=1 KANGAROO_METAL_GRP_SIZE=128 KANGAROO_METAL_NB_RUN=1 
   -o /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_result.txt \
   /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135.txt
 
-# 查看 workfile 确认 DP Count
-./kangaroo -winfo /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work
+
+# *** 查看 workfile 确认 DP Count
 
 cd /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo
 ./kangaroo -winfo /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work
 ./kangaroo -wcheck /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo/puzzle135_test.work
+
+# *** 合并 workfile
+cd /Users/zhaoanran/Desktop/keyhunt_2/Kangaroo && \
+./kangaroo -wm puzzle135_test.work puzzle135_test_gs64_nr96.work puzzle135_merged.work
 
 # 编译
 make clean && make gpu=1 sym=1 -j8
