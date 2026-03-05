@@ -250,8 +250,12 @@ bool HasExplicitStateCacheModeEnv() {
   return false;
 }
 
+// mode=4 (simd cooperative inversion) 当前放宽到 Metal 硬件线程组上限 1024。
+// 仍要求 32 对齐（对应 simdgroup 宽度）。
+constexpr int kMode4MaxThreadsPerGroup = 1024;
+
 bool IsMode4Eligible(int nbThreadPerGroup) {
-  return (nbThreadPerGroup % 32) == 0 && nbThreadPerGroup <= 256;
+  return (nbThreadPerGroup % 32) == 0 && nbThreadPerGroup <= kMode4MaxThreadsPerGroup;
 }
 
 const char *GetStateCacheKernelName(int mode) {
@@ -632,7 +636,7 @@ GPUEngine::GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_
     bool autoMode14 = (!explicitStateMode && !IsEnvEnabled("KANGAROO_METAL_DISABLE_AUTO_MODE14"));
 
     if(stateCacheMode == 4 && !IsMode4Eligible(nbThreadPerGroup)) {
-      printf("GPUEngine(Metal): stateCache=simd requires threads/group to be a multiple of 32 and <= 256, fallback to stateCache=none\n");
+      printf("GPUEngine(Metal): stateCache=simd requires threads/group to be a multiple of 32 and <= 1024, fallback to stateCache=none\n");
       stateCacheMode = 1;
     }
 #ifdef USE_SYMMETRY

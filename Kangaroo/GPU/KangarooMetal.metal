@@ -37,7 +37,7 @@ constant uint kNbJump = 32;
 constant uint kGpuGroupSize = static_cast<uint>(KANGAROO_METAL_GRP_SIZE);
 constant uint kNbRun = static_cast<uint>(KANGAROO_METAL_NB_RUN);
 constant uint kSimdWidth = 32u;
-constant uint kMaxCoopSimdGroups = 8u; // prototype path assumes <=256 threads/group.
+constant uint kMaxCoopSimdGroups = 32u; // 32 * 32 = 1024 threads/group (Metal hardware upper bound).
 
 constant uint kInvMode = 1u; // 0: divstep+fallback, 1: direct pow inversion
 constant ulong kP0 = 0xFFFFFFFEFFFFFC2Full;
