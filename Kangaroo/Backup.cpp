@@ -334,6 +334,158 @@ bool Kangaroo::ClassifyKangarooType(const Int *px,const Int *py,const Int *d,uin
 
 }
 
+void Kangaroo::CountKangarooTypesFromMeta(const std::vector<WORK_THREAD_META> &threadMeta,
+                                          uint64_t *tameCount,uint64_t *wildCount) const {
+
+  uint64_t tame = 0ULL;
+  uint64_t wild = 0ULL;
+
+  for(size_t i = 0; i < threadMeta.size(); i++) {
+    const WORK_THREAD_META &meta = threadMeta[i];
+    if((meta.flags & WORK_THREAD_META_GPU) != 0U &&
+       meta.gridSizeX > 0U &&
+       meta.gridSizeY > 0U &&
+       meta.groupSize > 0U &&
+       meta.nbKangaroo == (uint64_t)meta.gridSizeX * (uint64_t)meta.gridSizeY * (uint64_t)meta.groupSize) {
+      uint64_t perGroupTame = ((uint64_t)meta.gridSizeY + 1ULL) / 2ULL;
+      uint64_t perGroupWild = (uint64_t)meta.gridSizeY / 2ULL;
+      uint64_t groupCount = (uint64_t)meta.gridSizeX * (uint64_t)meta.groupSize;
+      tame += groupCount * perGroupTame;
+      wild += groupCount * perGroupWild;
+      continue;
+    }
+
+    tame += (meta.nbKangaroo + 1ULL) / 2ULL;
+    wild += meta.nbKangaroo / 2ULL;
+  }
+
+  if(tameCount != NULL) {
+    *tameCount = tame;
+  }
+  if(wildCount != NULL) {
+    *wildCount = wild;
+  }
+
+}
+
+bool Kangaroo::CountKangarooTypesFromStream(FILE *f,uint64_t totalWalk,bool hasSymClass,
+                                            uint64_t *tameCount,uint64_t *wildCount,
+                                            uint64_t *invalidCount) {
+
+  if(f == NULL) {
+    return false;
+  }
+
+  uint64_t tame = 0ULL;
+  uint64_t wild = 0ULL;
+  uint64_t invalid = 0ULL;
+  uint64_t remaining = totalWalk;
+  const uint64_t chunkSize = 4096ULL;
+
+  auto sameXAt = [](const Point &p,const std::vector<Int> &xs,size_t i) -> bool {
+    return p.x.bits64[0] == xs[i].bits64[0] &&
+           p.x.bits64[1] == xs[i].bits64[1] &&
+           p.x.bits64[2] == xs[i].bits64[2] &&
+           p.x.bits64[3] == xs[i].bits64[3];
+  };
+
+  while(remaining > 0ULL) {
+    uint64_t batch = std::min<uint64_t>(remaining,chunkSize);
+    std::vector<Int> xs((size_t)batch);
+    std::vector<Int> ds((size_t)batch);
+
+    for(uint64_t i = 0; i < batch; i++) {
+      Int py;
+      if(::fread(&xs[(size_t)i].bits64,32,1,f) != 1) return false;
+      xs[(size_t)i].bits64[4] = 0;
+      if(::fread(&py.bits64,32,1,f) != 1) return false;
+      py.bits64[4] = 0;
+      if(::fread(&ds[(size_t)i].bits64,32,1,f) != 1) return false;
+      ds[(size_t)i].bits64[4] = 0;
+      if(hasSymClass) {
+        uint64_t sc = 0ULL;
+        if(::fread(&sc,sizeof(uint64_t),1,f) != 1) return false;
+      }
+    }
+
+    std::vector<Point> walks = secp->ComputePublicKeys(ds);
+    std::vector<size_t> unresolved;
+    unresolved.reserve((size_t)batch);
+
+    for(size_t i = 0; i < (size_t)batch; i++) {
+      if(sameXAt(walks[i],xs,i)) {
+        tame++;
+      } else {
+        unresolved.push_back(i);
+      }
+    }
+
+    if(!unresolved.empty()) {
+      std::vector<Point> wildBases;
+      std::vector<Point> wildInputs;
+      wildBases.reserve(unresolved.size());
+      wildInputs.reserve(unresolved.size());
+      for(size_t idx : unresolved) {
+        wildBases.push_back(keyToSearch);
+        wildInputs.push_back(walks[idx]);
+      }
+      std::vector<Point> wildPoints = secp->AddDirect(wildBases,wildInputs);
+      std::vector<size_t> unresolvedAlt;
+      unresolvedAlt.reserve(unresolved.size());
+
+      for(size_t j = 0; j < unresolved.size(); j++) {
+        size_t idx = unresolved[j];
+        if(sameXAt(wildPoints[j],xs,idx)) {
+          wild++;
+        } else {
+          unresolvedAlt.push_back(idx);
+        }
+      }
+
+#ifdef USE_SYMMETRY
+      if(!unresolvedAlt.empty()) {
+        std::vector<Point> altBases;
+        std::vector<Point> altInputs;
+        altBases.reserve(unresolvedAlt.size());
+        altInputs.reserve(unresolvedAlt.size());
+        for(size_t idx : unresolvedAlt) {
+          altBases.push_back(keyToSearchNeg);
+          altInputs.push_back(walks[idx]);
+        }
+        std::vector<Point> wildAlt = secp->AddDirect(altBases,altInputs);
+        std::vector<size_t> stillUnresolved;
+        stillUnresolved.reserve(unresolvedAlt.size());
+        for(size_t j = 0; j < unresolvedAlt.size(); j++) {
+          size_t idx = unresolvedAlt[j];
+          if(sameXAt(wildAlt[j],xs,idx)) {
+            wild++;
+          } else {
+            stillUnresolved.push_back(idx);
+          }
+        }
+        unresolvedAlt.swap(stillUnresolved);
+      }
+#endif
+      invalid += (uint64_t)unresolvedAlt.size();
+    }
+
+    remaining -= batch;
+  }
+
+  if(tameCount != NULL) {
+    *tameCount = tame;
+  }
+  if(wildCount != NULL) {
+    *wildCount = wild;
+  }
+  if(invalidCount != NULL) {
+    *invalidCount = invalid;
+  }
+
+  return true;
+
+}
+
 bool Kangaroo::SaveThreadLayout(FILE *f,TH_PARAM *threads,int nbThread) {
 
   uint32_t magic = WORK_THREAD_META_MAGIC;
@@ -1617,15 +1769,78 @@ void Kangaroo::WorkInfo(std::string &fName) {
     return;
   }
 
-  // Read hashTable
+  // winfo 在需要按状态判型时也要具备完整搜索上下文，否则无法正确识别 WILD。
+  keysToSearch.clear();
+  keysToSearch.push_back(k1);
+  keyIdx = 0;
+  collisionInSameHerd = 0;
+  rangeStart.Set(&RS1);
+  rangeEnd.Set(&RE1);
+  rangeWidth.Set(&rangeEnd);
+  rangeWidth.Sub(&rangeStart);
+  rangePower = rangeWidth.GetBitLength();
+  rangeWidthDiv2.Set(&rangeWidth);
+  rangeWidthDiv2.ShiftR(1);
+  rangeWidthDiv4.Set(&rangeWidthDiv2);
+  rangeWidthDiv4.ShiftR(1);
+  rangeWidthDiv8.Set(&rangeWidthDiv4);
+  rangeWidthDiv8.ShiftR(1);
+  InitSearchKey();
+
+  uint64_t dpTameCount = 0ULL;
+  uint64_t dpWildCount = 0ULL;
+  Int dpDist;
+  uint32_t dpType = 0U;
+
+  auto scanDpTable = [&](FILE *f,uint32_t from,uint32_t to) -> bool {
+    if(f == NULL) {
+      return false;
+    }
+    for(uint32_t h = from; h < to; h++) {
+      if(::fread(&hashTable.E[h].nbItem,sizeof(uint32_t),1,f) != 1) return false;
+      if(::fread(&hashTable.E[h].maxItem,sizeof(uint32_t),1,f) != 1) return false;
+      for(uint32_t i = 0; i < hashTable.E[h].nbItem; i++) {
+        int128_t x;
+        int192_t d;
+        if(::fread(&x,16,1,f) != 1) return false;
+        if(::fread(&d,24,1,f) != 1) return false;
+        HashTable::CalcDistAndType(d,&dpDist,&dpType);
+        if(dpType == TAME) {
+          dpTameCount++;
+        } else {
+          dpWildCount++;
+        }
+      }
+    }
+    return true;
+  };
+
+  // Read hashTable and count per-type DP in one pass.
+  hashTable.Reset();
+  bool dpScanOk = true;
   if(isDir) {
     for(int i = 0; i < MERGE_PART; i++) {
       FILE* f = OpenPart(fName,"rb",i);
-      hashTable.SeekNbItem(f,i * H_PER_PART,(i + 1) * H_PER_PART);
+      if(f == NULL) {
+        dpScanOk = false;
+        break;
+      }
+      if(!scanDpTable(f,i * H_PER_PART,(i + 1) * H_PER_PART)) {
+        dpScanOk = false;
+      }
       fclose(f);
+      if(!dpScanOk) {
+        break;
+      }
     }
   } else {
-    hashTable.SeekNbItem(f1);
+    dpScanOk = scanDpTable(f1,0,HASH_SIZE);
+  }
+
+  if(!dpScanOk) {
+    ::printf("WorkInfo: failed to scan hash table\n");
+    fclose(f1);
+    return;
   }
 
   ::printf("Version   : %d\n",version);
@@ -1640,6 +1855,13 @@ void Kangaroo::WorkInfo(std::string &fName) {
 #endif
   ::printf("Time      : %s\n",GetTimeStr(time1).c_str());
   hashTable.PrintInfo();
+#ifdef WIN64
+  ::printf("DP TAME   : %I64d\n",dpTameCount);
+  ::printf("DP WILD   : %I64d\n",dpWildCount);
+#else
+  ::printf("DP TAME   : %" PRId64 "\n",dpTameCount);
+  ::printf("DP WILD   : %" PRId64 "\n",dpWildCount);
+#endif
 
   fread(&nbLoadedWalk,sizeof(uint64_t),1,f1);
 #ifdef WIN64
@@ -1656,6 +1878,13 @@ void Kangaroo::WorkInfo(std::string &fName) {
   }
 #endif
 
+  uint64_t tameCount = 0ULL;
+  uint64_t wildCount = 0ULL;
+  uint64_t invalidCount = 0ULL;
+  bool typeCountReady = false;
+  bool needStateScan = false;
+  bool hasSymClass = (version >= 1U);
+
   if(WorkFileHasThreadMeta(version)) {
     uint32_t magic = 0U;
     uint32_t threadCount = 0U;
@@ -1664,16 +1893,21 @@ void Kangaroo::WorkInfo(std::string &fName) {
        magic == WORK_THREAD_META_MAGIC) {
       if(threadCount == 0U) {
         ::printf("ThreadMeta: no\n");
+        needStateScan = (nbLoadedWalk > 0);
       } else {
         ::printf("ThreadMeta: yes (%u threads)\n",threadCount);
+        std::vector<WORK_THREAD_META> infoMeta;
+        infoMeta.reserve(threadCount);
+        bool metaReadOk = true;
         for(uint32_t i = 0; i < threadCount; i++) {
           WORK_THREAD_META meta;
           memset(&meta,0,sizeof(meta));
-          if(::fread(&meta.flags,sizeof(uint32_t),1,f1) != 1) break;
-          if(::fread(&meta.gridSizeX,sizeof(uint32_t),1,f1) != 1) break;
-          if(::fread(&meta.gridSizeY,sizeof(uint32_t),1,f1) != 1) break;
-          if(::fread(&meta.groupSize,sizeof(uint32_t),1,f1) != 1) break;
-          if(::fread(&meta.nbKangaroo,sizeof(uint64_t),1,f1) != 1) break;
+          if(::fread(&meta.flags,sizeof(uint32_t),1,f1) != 1) { metaReadOk = false; break; }
+          if(::fread(&meta.gridSizeX,sizeof(uint32_t),1,f1) != 1) { metaReadOk = false; break; }
+          if(::fread(&meta.gridSizeY,sizeof(uint32_t),1,f1) != 1) { metaReadOk = false; break; }
+          if(::fread(&meta.groupSize,sizeof(uint32_t),1,f1) != 1) { metaReadOk = false; break; }
+          if(::fread(&meta.nbKangaroo,sizeof(uint64_t),1,f1) != 1) { metaReadOk = false; break; }
+          infoMeta.push_back(meta);
           if((meta.flags & WORK_THREAD_META_GPU) != 0U) {
             ::printf("  Thread[%u]: GPU grid=(%u,%u) grp=%u kangaroos=%" PRIu64 "\n",
                      i,
@@ -1685,12 +1919,49 @@ void Kangaroo::WorkInfo(std::string &fName) {
             ::printf("  Thread[%u]: CPU kangaroos=%" PRIu64 "\n",i,meta.nbKangaroo);
           }
         }
+        if(metaReadOk && infoMeta.size() == threadCount) {
+          CountKangarooTypesFromMeta(infoMeta,&tameCount,&wildCount);
+          typeCountReady = true;
+        } else {
+          ::printf("ThreadMeta: invalid or truncated\n");
+        }
       }
     } else {
       ::printf("ThreadMeta: invalid or missing\n");
     }
   } else {
     ::printf("ThreadMeta: no\n");
+    if(nbLoadedWalk > 0) {
+      // legacy v2 没有线程元数据，但保存顺序仍然编码了 TAME/WILD 交替关系。
+      tameCount = ((uint64_t)nbLoadedWalk + 1ULL) / 2ULL;
+      wildCount = (uint64_t)nbLoadedWalk / 2ULL;
+      typeCountReady = true;
+    }
+  }
+
+  if(needStateScan && !typeCountReady) {
+    if(!CountKangarooTypesFromStream(f1,(uint64_t)nbLoadedWalk,hasSymClass,
+                                     &tameCount,&wildCount,&invalidCount)) {
+      ::printf("KangarooType: failed to classify saved kangaroos\n");
+    } else {
+      typeCountReady = true;
+    }
+  }
+
+  if(typeCountReady || nbLoadedWalk == 0) {
+#ifdef WIN64
+    ::printf("Kangaroo TAME : %I64d\n",tameCount);
+    ::printf("Kangaroo WILD : %I64d\n",wildCount);
+    if(invalidCount > 0ULL) {
+      ::printf("Kangaroo Bad  : %I64d\n",invalidCount);
+    }
+#else
+    ::printf("Kangaroo TAME : %" PRId64 "\n",tameCount);
+    ::printf("Kangaroo WILD : %" PRId64 "\n",wildCount);
+    if(invalidCount > 0ULL) {
+      ::printf("Kangaroo Bad  : %" PRId64 "\n",invalidCount);
+    }
+#endif
   }
 
   fclose(f1);

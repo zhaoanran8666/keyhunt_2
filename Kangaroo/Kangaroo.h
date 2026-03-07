@@ -249,6 +249,11 @@ private:
   bool IsThreadMetaCompatible(const WORK_THREAD_META &saved,const TH_PARAM &current,bool gpuThread) const;
   uint32_t GetWalkerTypeForMeta(const WORK_THREAD_META &meta,uint64_t localIndex) const;
   bool ClassifyKangarooType(const Int *px,const Int *py,const Int *d,uint32_t *type);
+  void CountKangarooTypesFromMeta(const std::vector<WORK_THREAD_META> &threadMeta,
+                                  uint64_t *tameCount,uint64_t *wildCount) const;
+  bool CountKangarooTypesFromStream(FILE *f,uint64_t totalWalk,bool hasSymClass,
+                                    uint64_t *tameCount,uint64_t *wildCount,
+                                    uint64_t *invalidCount);
   bool RestoreKangaroosDirect(TH_PARAM *threads,int nbThread,std::vector<int192_t> *kangs = NULL);
   bool RestoreKangaroosReordered(TH_PARAM *threads,int nbThread,std::vector<int192_t> *kangs = NULL,
                                  bool tolerateInvalid = false,bool trustSourceMeta = true,
