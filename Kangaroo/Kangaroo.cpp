@@ -20,6 +20,7 @@
 #include "SECPK1/IntGroup.h"
 #include "Timer.h"
 #include <string.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -64,6 +65,30 @@ static const char *StateCacheModeName(int mode) {
   }
 }
 
+static bool IsEnabledEnvFlag(const char *name) {
+  const char *value = ::getenv(name);
+  if(value == NULL) return false;
+  return !(strcmp(value,"0") == 0 ||
+           strcmp(value,"false") == 0 ||
+           strcmp(value,"False") == 0 ||
+           strcmp(value,"FALSE") == 0 ||
+           strcmp(value,"no") == 0 ||
+           strcmp(value,"off") == 0);
+}
+
+static int128_t PointToX128(const Point &p) {
+  int128_t out;
+  out.i64[0] = p.x.bits64[0];
+  out.i64[1] = p.x.bits64[1];
+  return out;
+}
+
+static bool MatchEntryPoint(uint64_t h,const int128_t *x,const Point &p) {
+  return ((p.x.bits64[2] & HASH_MASK) == h) &&
+         (p.x.bits64[0] == x->i64[0]) &&
+         (p.x.bits64[1] == x->i64[1]);
+}
+
 // ----------------------------------------------------------------------------
 
 Kangaroo::Kangaroo(Secp256K1 *secp,int32_t initDPSize,bool useGpu,string &workFile,string &iWorkFile,uint32_t savePeriod,bool saveKangaroo,bool saveKangarooByServer,
@@ -80,6 +105,7 @@ Kangaroo::Kangaroo(Secp256K1 *secp,int32_t initDPSize,bool useGpu,string &workFi
   this->nbLoadedWalk = 0;
   this->loadedWorkVersion = 0;
   this->loadedWorkHasSymClass = false;
+  this->loadedWorkHasThreadMeta = false;
   this->clientMode = serverIp.length() > 0;
   this->saveKangarooByServer = this->clientMode && saveKangarooByServer;
   this->saveKangaroo = saveKangaroo || this->saveKangarooByServer;
@@ -103,6 +129,10 @@ Kangaroo::Kangaroo(Secp256K1 *secp,int32_t initDPSize,bool useGpu,string &workFi
   this->lastAddGpuKIdx = 0;
   this->lastAddGpuStateCacheMode = -1;
   this->lastAddGpuRunCount = 0;
+  this->lastAddSymClassValid = false;
+  this->lastAddSymClass = 0;
+  this->onlineDpCheckEnabled = IsEnabledEnvFlag("KANGAROO_ONLINE_DP_CHECK");
+  this->onlineDpCheckFailed.store(false,std::memory_order_relaxed);
   this->keyIdx = 0;
   this->splitWorkfile = splitWorkfile;
   this->pid = Timer::getPID();
@@ -358,6 +388,15 @@ bool Kangaroo::CollisionCheck(Int* d1,uint32_t type1,Int* d2,uint32_t type2) {
 
 bool Kangaroo::AddToTable(Int *pos,Int *dist,uint32_t kType) {
 
+  if(onlineDpCheckEnabled) {
+    int128_t x;
+    int192_t rawD;
+    uint64_t h;
+    HashTable::Convert(pos,dist,kType,&h,&x,&rawD);
+    if(!ValidateDpBeforeAdd(h,&x,dist,kType))
+      return false;
+  }
+
   int addStatus = hashTable.Add(pos,dist,kType);
   if(addStatus== ADD_COLLISION)
     return CollisionCheck(&hashTable.kDist,hashTable.kType,dist,kType);
@@ -367,6 +406,14 @@ bool Kangaroo::AddToTable(Int *pos,Int *dist,uint32_t kType) {
 }
 
 bool Kangaroo::AddToTable(uint64_t h,int128_t *x,int192_t *d) {
+
+  if(onlineDpCheckEnabled) {
+    Int dist;
+    uint32_t kType;
+    HashTable::CalcDistAndType(*d,&dist,&kType);
+    if(!ValidateDpBeforeAdd(h,x,&dist,kType))
+      return false;
+  }
 
   int addStatus = hashTable.Add(h,x,d);
   if(addStatus== ADD_COLLISION) {
@@ -379,6 +426,94 @@ bool Kangaroo::AddToTable(uint64_t h,int128_t *x,int192_t *d) {
   }
 
   return addStatus == ADD_OK;
+
+}
+
+bool Kangaroo::ValidateDpBeforeAdd(uint64_t h,const int128_t *x,const Int *dist,uint32_t kType) {
+
+  Int distValue(*dist);
+  Point walk = secp->ComputePublicKey(&distValue);
+  Point expectedPrimary = walk;
+  if(kType == WILD)
+    expectedPrimary = secp->AddDirect(keyToSearch,walk);
+
+  bool ok = MatchEntryPoint(h,x,expectedPrimary);
+#ifdef USE_SYMMETRY
+  Point expectedAlt;
+  Point *expectedAltPtr = NULL;
+  if(!ok && kType == WILD) {
+    expectedAlt = secp->AddDirect(keyToSearchNeg,walk);
+    expectedAltPtr = &expectedAlt;
+    ok = MatchEntryPoint(h,x,expectedAlt);
+  }
+#else
+  Point *expectedAltPtr = NULL;
+#endif
+
+  if(ok)
+    return true;
+
+  bool expected = false;
+  if(onlineDpCheckFailed.compare_exchange_strong(expected,true,std::memory_order_acq_rel)) {
+    ReportOnlineDpMismatch(h,x,dist,kType,expectedPrimary,expectedAltPtr);
+  }
+
+  endOfSearch = true;
+  return false;
+
+}
+
+void Kangaroo::ReportOnlineDpMismatch(uint64_t h,const int128_t *x,const Int *dist,uint32_t kType,
+                                      const Point &expectedPrimary,const Point *expectedAlt) {
+
+  Int distValue(*dist);
+  int128_t expectedPrimaryX = PointToX128(expectedPrimary);
+  ::printf("\nOnlineDPCheck: mismatch before hash insert\n");
+  ::printf("OnlineDPCheck: source=%s type=%s dist=%s\n",
+           lastAddFromGpu ? "gpu" : "cpu",
+           kType == TAME ? "TAME" : "WILD",
+           distValue.GetBase16().c_str());
+  ::printf("OnlineDPCheck: bucket actual=%06" PRIX64 " primary=%06" PRIX64,
+           h,
+           expectedPrimary.x.bits64[2] & HASH_MASK);
+#ifdef USE_SYMMETRY
+  if(expectedAlt != NULL)
+    ::printf(" alt=%06" PRIX64,expectedAlt->x.bits64[2] & HASH_MASK);
+#endif
+  ::printf("\n");
+  ::printf("OnlineDPCheck: x actual=%s primary=%s",
+           Hex128(*x).c_str(),
+           Hex128(expectedPrimaryX).c_str());
+#ifdef USE_SYMMETRY
+  if(expectedAlt != NULL) {
+    int128_t expectedAltX = PointToX128(*expectedAlt);
+    ::printf(" alt=%s",Hex128(expectedAltX).c_str());
+  }
+#endif
+  ::printf("\n");
+  if(kType == WILD) {
+    Point tameExpected = secp->ComputePublicKey(&distValue);
+    int128_t tameExpectedX = PointToX128(tameExpected);
+    ::printf("OnlineDPCheck: tame bucket=%06" PRIX64 " x=%s match=%s\n",
+             tameExpected.x.bits64[2] & HASH_MASK,
+             Hex128(tameExpectedX).c_str(),
+             MatchEntryPoint(h,x,tameExpected) ? "yes" : "no");
+  }
+#ifdef USE_SYMMETRY
+  if(lastAddSymClassValid) {
+    ::printf("OnlineDPCheck: symClass=%" PRIu64 "\n",lastAddSymClass & 1ULL);
+  } else {
+    ::printf("OnlineDPCheck: symClass=NA\n");
+  }
+#endif
+  if(lastAddFromGpu) {
+    ::printf("OnlineDPCheck: gpu kIdx=%" PRIu64 " stateCache=%s(%d) nbRun=%d\n",
+             lastAddGpuKIdx,
+             StateCacheModeName(lastAddGpuStateCacheMode),
+             lastAddGpuStateCacheMode,
+             lastAddGpuRunCount);
+  }
+  ::printf("OnlineDPCheck: stopping search before invalid DP is inserted\n");
 
 }
 
@@ -520,7 +655,16 @@ void Kangaroo::SolveKeyCPU(TH_PARAM *ph) {
           if(!endOfSearch) {
 
             lastAddFromGpu = false;
+            lastAddSymClassValid = false;
+#ifdef USE_SYMMETRY
+            if(ph->symClass != NULL) {
+              lastAddSymClass = ph->symClass[g];
+              lastAddSymClassValid = true;
+            }
+#endif
             if(!AddToTable(&ph->px[g],&ph->distance[g],g % 2)) {
+              if(onlineDpCheckFailed.load(std::memory_order_acquire))
+                continue;
               // Collision inside the same herd
               // We need to reset the kangaroo
               CreateHerd(1,&ph->px[g],&ph->py[g],&ph->distance[g],g % 2,false);
@@ -701,8 +845,13 @@ void Kangaroo::SolveKeyGPU(TH_PARAM *ph) {
           lastAddGpuKIdx = gpuFound[g].kIdx;
           lastAddGpuStateCacheMode = gpu->GetStateCacheMode();
           lastAddGpuRunCount = gpu->GetRunCount();
+#ifdef USE_SYMMETRY
+          lastAddSymClassValid = gpu->GetKangarooSymClass(gpuFound[g].kIdx,&lastAddSymClass);
+#endif
 
           if(!AddToTable(&gpuFound[g].x,&gpuFound[g].d,kType)) {
+            if(onlineDpCheckFailed.load(std::memory_order_acquire))
+              continue;
 #ifdef USE_SYMMETRY
             if(lastCollisionWasUnexpectedWrong && !unexpectedCollisionGpuDiagPrinted) {
               uint64_t symClass = 0ULL;
@@ -1104,6 +1253,7 @@ void Kangaroo::Run(int nbThread,std::vector<int> gpuId,std::vector<int> gridSize
     } else {
       params[nbCPUThread + i].gridSizeX = x;
       params[nbCPUThread + i].gridSizeY = y;
+      params[nbCPUThread + i].groupSize = gpuGroupSize;
     }
     params[nbCPUThread + i].nbKangaroo = (uint64_t)gpuGroupSize * x * y;
     totalRW += params[nbCPUThread + i].nbKangaroo;
@@ -1150,10 +1300,10 @@ void Kangaroo::Run(int nbThread,std::vector<int> gpuId,std::vector<int> gridSize
 
   } else {
 
-    keyIdx = 0;
-    InitSearchKey();
-
   }
+
+  keyIdx = 0;
+  InitSearchKey();
 
   SetDP(initDPSize);
 

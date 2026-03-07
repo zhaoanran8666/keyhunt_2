@@ -69,6 +69,7 @@ typedef struct {
 #ifdef WITHGPU
   int  gridSizeX;
   int  gridSizeY;
+  int  groupSize;
   int  gpuId;
 #endif
 
@@ -117,10 +118,54 @@ typedef struct {
   DP *dp;
 } DP_CACHE;
 
+// work v3: 保存每个线程的 kangaroo 布局，用于跨几何恢复时重排槽位顺序。
+typedef struct {
+  uint32_t flags;      // bit0=GPU 线程
+  uint32_t gridSizeX;  // GPU: block 数，CPU: 0
+  uint32_t gridSizeY;  // GPU: threads/group，CPU: 0
+  uint32_t groupSize;  // GPU: 每个线程槽位组大小，CPU: 0
+  uint64_t nbKangaroo; // 该线程保存的 kangaroo 数量
+} WORK_THREAD_META;
+
 // Work file type
 #define HEADW  0xFA6A8001  // Full work file
 #define HEADK  0xFA6A8002  // Kangaroo only file
 #define HEADKS 0xFA6A8003  // Compressed Kangaroo only file
+
+#define WORK_THREAD_META_MAGIC 0x4B47524DU // "KGRM"
+#define WORK_THREAD_META_GPU   0x00000001U
+
+static inline uint32_t GetCurrentWorkFileVersion() {
+#ifdef USE_SYMMETRY
+  return 3U;
+#else
+  return 2U;
+#endif
+}
+
+static inline uint32_t GetMinReadableWorkFileVersion() {
+#ifdef USE_SYMMETRY
+  return 2U;
+#else
+  return 1U;
+#endif
+}
+
+static inline bool WorkFileHasThreadMeta(uint32_t version) {
+#ifdef USE_SYMMETRY
+  return version >= 3U;
+#else
+  return version >= 2U;
+#endif
+}
+
+static inline uint32_t NormalizeMergeCompatibleWorkVersion(uint32_t version) {
+#ifdef USE_SYMMETRY
+  return version >= 2U ? 2U : version;
+#else
+  return version >= 1U ? 1U : version;
+#endif
+}
 
 // Number of Hash entry per partition
 #define H_PER_PART (HASH_SIZE / MERGE_PART)
@@ -140,6 +185,8 @@ public:
   void MergeDir(std::string& dirname,std::string& dest);
   bool MergeWork(std::string &file1,std::string &file2,std::string &dest,bool printStat=true);
   void WorkInfo(std::string &fileName);
+  bool CleanWorkFile(int nbThread,std::vector<int> gpuId,std::vector<int> gridSize,
+                     std::string &inputFile,std::string &outputFile);
   bool MergeWorkPart(std::string& file1,std::string& file2,bool printStat);
   bool MergeWorkPartPart(std::string& part1Name,std::string& part2Name);
   static void CreateEmptyPartWork(std::string& partName);
@@ -168,6 +215,9 @@ private:
   void CreateJumpTable();
   bool AddToTable(uint64_t h,int128_t *x,int192_t *d);
   bool AddToTable(Int *pos,Int *dist,uint32_t kType);
+  bool ValidateDpBeforeAdd(uint64_t h,const int128_t *x,const Int *dist,uint32_t kType);
+  void ReportOnlineDpMismatch(uint64_t h,const int128_t *x,const Int *dist,uint32_t kType,
+                              const Point &expectedPrimary,const Point *expectedAlt);
   bool SendToServer(std::vector<ITEM> &dp,uint32_t threadId,uint32_t gpuId);
   bool CheckKey(Int d1,Int d2,uint8_t type);
   bool CollisionCheck(Int* d1,uint32_t type1,Int* d2,uint32_t type2);
@@ -186,6 +236,8 @@ private:
   void FectchKangaroos(TH_PARAM *threads);
   FILE *ReadHeader(std::string fileName,uint32_t *version,int type);
   bool  SaveHeader(std::string fileName,FILE* f,int type,uint64_t totalCount,double totalTime);
+  bool  SaveThreadLayout(FILE *f,TH_PARAM *threads,int nbThread);
+  bool  LoadThreadLayout(FILE *f);
   int FSeek(FILE *stream,uint64_t pos);
   uint64_t FTell(FILE *stream);
   int IsDir(std::string dirName);
@@ -193,6 +245,19 @@ private:
   static std::string GetPartName(std::string& partName,int i,bool tmpPart);
   static FILE* OpenPart(std::string& partName,char* mode,int i,bool tmpPart=false);
   uint32_t CheckHash(uint32_t h,uint32_t nbItem,HashTable* hT,FILE* f);
+  WORK_THREAD_META GetThreadMeta(const TH_PARAM &thread,bool gpuThread) const;
+  bool IsThreadMetaCompatible(const WORK_THREAD_META &saved,const TH_PARAM &current,bool gpuThread) const;
+  uint32_t GetWalkerTypeForMeta(const WORK_THREAD_META &meta,uint64_t localIndex) const;
+  bool ClassifyKangarooType(const Int *px,const Int *py,const Int *d,uint32_t *type);
+  bool RestoreKangaroosDirect(TH_PARAM *threads,int nbThread,std::vector<int192_t> *kangs = NULL);
+  bool RestoreKangaroosReordered(TH_PARAM *threads,int nbThread,std::vector<int192_t> *kangs = NULL,
+                                 bool tolerateInvalid = false,bool trustSourceMeta = true,
+                                 uint64_t *invalidDiscarded = NULL,uint64_t *restoredCount = NULL,
+                                 uint64_t *unhandledCount = NULL);
+  bool StreamRepairableKangaroos(FILE *fOut,uint64_t *kept,uint64_t *invalidDiscarded);
+  bool RebuildCleanHashTable(uint64_t *kept,uint64_t *removed,uint64_t *duplicates,uint64_t *conflicts);
+  void AllocateThreadKangaroos(TH_PARAM *threads,int nbThread);
+  void FreeThreadKangaroos(TH_PARAM *threads,int nbThread);
 
 
   // Network stuff
@@ -255,6 +320,10 @@ private:
   uint64_t lastAddGpuKIdx;
   int lastAddGpuStateCacheMode;
   int lastAddGpuRunCount;
+  bool lastAddSymClassValid;
+  uint64_t lastAddSymClass;
+  bool onlineDpCheckEnabled;
+  std::atomic<bool> onlineDpCheckFailed;
   std::vector<Point> keysToSearch;
   Point keyToSearch;
   Point keyToSearchNeg;
@@ -280,6 +349,8 @@ private:
   int64_t nbLoadedWalk;
   uint32_t loadedWorkVersion;
   bool loadedWorkHasSymClass;
+  bool loadedWorkHasThreadMeta;
+  std::vector<WORK_THREAD_META> loadedWorkThreadMeta;
   std::string workFile;
   std::string inputFile;
   int  saveWorkPeriod;

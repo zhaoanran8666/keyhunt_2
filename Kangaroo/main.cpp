@@ -53,6 +53,7 @@ void printUsage() {
   printf(" -winfo file1: Work file info file\n");
   printf(" -wpartcreate name: Create empty partitioned work file (name is a directory)\n");
   printf(" -wcheck worfile: Check workfile integrity\n");
+  printf(" -wclean srcWork destWork: Clean bad DP and preserve repairable kangaroos without creating fresh ones\n");
   printf(" -m maxStep: number of operations before give up the search (maxStep*expected operation)\n");
   printf(" -s: Start in server mode\n");
   printf(" -c server_ip: Start in client mode and connect to server server_ip\n");
@@ -146,6 +147,8 @@ static vector<int> gpuId = { 0 };
 static vector<int> gridSize;
 static string workFile = "";
 static string checkWorkFile = "";
+static string cleanWorkIn = "";
+static string cleanWorkOut = "";
 static string iWorkFile = "";
 static uint32_t savePeriod = 60;
 static bool saveKangaroo = false;
@@ -232,6 +235,12 @@ int main(int argc, char* argv[]) {
     }  else if(strcmp(argv[a],"-wcheck") == 0) {
       CHECKARG("-wcheck",1);
       checkWorkFile = string(argv[a]);
+      a++;
+    }  else if(strcmp(argv[a],"-wclean") == 0) {
+      CHECKARG("-wclean",1);
+      cleanWorkIn = string(argv[a]);
+      CHECKARG("-wclean",2);
+      cleanWorkOut = string(argv[a]);
       a++;
     }  else if(strcmp(argv[a],"-winfo") == 0) {
       CHECKARG("-winfo",1);
@@ -326,6 +335,10 @@ int main(int argc, char* argv[]) {
   } else {
     if(checkWorkFile.length() > 0) {
       v->CheckWorkFile(nbCPUThread,checkWorkFile);
+      exit(0);
+    } else if(cleanWorkIn.length() > 0) {
+      if(!v->CleanWorkFile(nbCPUThread,gpuId,gridSize,cleanWorkIn,cleanWorkOut))
+        exit(-1);
       exit(0);
     } if(infoFile.length()>0) {
       v->WorkInfo(infoFile);

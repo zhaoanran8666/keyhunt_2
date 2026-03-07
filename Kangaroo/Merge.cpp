@@ -105,8 +105,8 @@ bool Kangaroo::MergeWork(std::string& file1,std::string& file2,std::string& dest
   ::fread(&count2,sizeof(uint64_t),1,f2);
   ::fread(&time2,sizeof(double),1,f2);
 
-  if(v1 != v2) {
-    ::printf("MergeWork: cannot merge workfile of different version\n");
+  if(NormalizeMergeCompatibleWorkVersion(v1) != NormalizeMergeCompatibleWorkVersion(v2)) {
+    ::printf("MergeWork: cannot merge workfile of incompatible version (%u vs %u)\n",v1,v2);
     fclose(f1);
     fclose(f2);
     return true;
@@ -211,6 +211,9 @@ bool Kangaroo::MergeWork(std::string& file1,std::string& file2,std::string& dest
 
   fclose(f1);
   fclose(f2);
+  uint64_t totalWalk = 0ULL;
+  ::fwrite(&totalWalk,sizeof(uint64_t),1,f);
+  SaveThreadLayout(f,NULL,0);
   fclose(f);
 
   t1 = Timer::get_tick();

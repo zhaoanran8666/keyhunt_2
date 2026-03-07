@@ -195,7 +195,11 @@ void Kangaroo::ProcessServer() {
       DP_CACHE dp = localCache[i];
       for(int j = 0; j<(int)dp.nbDP && !endOfSearch; j++) {
         uint64_t h = dp.dp[j].h;
+        lastAddFromGpu = false;
+        lastAddSymClassValid = false;
         if(!AddToTable(h,&dp.dp[j].x,&dp.dp[j].d)) {
+          if(onlineDpCheckFailed.load(std::memory_order_acquire))
+            continue;
           // Collision inside the same herd
           collisionInSameHerd++;
         }

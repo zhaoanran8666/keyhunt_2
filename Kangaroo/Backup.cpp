@@ -199,9 +199,11 @@ bool Kangaroo::LoadWork(string &fileName) {
 
   loadedWorkVersion = version;
   loadedWorkHasSymClass = (loadedWorkVersion >= 1);
+  loadedWorkHasThreadMeta = false;
+  loadedWorkThreadMeta.clear();
 
 #ifdef USE_SYMMETRY
-  if(loadedWorkVersion < 2) {
+  if(loadedWorkVersion < GetMinReadableWorkFileVersion()) {
     ::printf("LoadWork: ERROR - workfile version %d uses 128-bit distance (incompatible with 192-bit format).\n",
              loadedWorkVersion);
     ::printf("LoadWork: Please discard this workfile and start a fresh run.\n");
@@ -210,7 +212,7 @@ bool Kangaroo::LoadWork(string &fileName) {
     return false;
   }
 #else
-  if(loadedWorkVersion < 1) {
+  if(loadedWorkVersion < GetMinReadableWorkFileVersion()) {
     ::printf("LoadWork: WARNING - legacy workfile version %d (no 192-bit distance upgrade).\n",
              loadedWorkVersion);
     ::printf("LoadWork: HashTable format may be incompatible. Discarding old workfile.\n");
@@ -223,6 +225,12 @@ bool Kangaroo::LoadWork(string &fileName) {
   // Read number of walk
   fread(&nbLoadedWalk,sizeof(uint64_t),1,fRead);
 
+  if(WorkFileHasThreadMeta(loadedWorkVersion) && !LoadThreadLayout(fRead)) {
+    ::fclose(fRead);
+    fRead = NULL;
+    return false;
+  }
+
 #ifdef USE_SYMMETRY
   if(nbLoadedWalk > 0 && !loadedWorkHasSymClass) {
     ::printf("LoadWork: Warning legacy workfile has no symmetry class state, restoring with symClass=0\n");
@@ -234,6 +242,833 @@ bool Kangaroo::LoadWork(string &fileName) {
   ::printf("LoadWork: [HashTable %s] [%s]\n",hashTable.GetSizeInfo().c_str(),GetTimeStr(t1 - t0).c_str());
 
   return true;
+}
+
+// ----------------------------------------------------------------------------
+
+WORK_THREAD_META Kangaroo::GetThreadMeta(const TH_PARAM &thread,bool gpuThread) const {
+
+  WORK_THREAD_META meta;
+  memset(&meta,0,sizeof(meta));
+  meta.nbKangaroo = thread.nbKangaroo;
+
+#ifdef WITHGPU
+  if(gpuThread) {
+    meta.flags = WORK_THREAD_META_GPU;
+    meta.gridSizeX = (uint32_t)thread.gridSizeX;
+    meta.gridSizeY = (uint32_t)thread.gridSizeY;
+    meta.groupSize = (uint32_t)thread.groupSize;
+  }
+#else
+  (void)gpuThread;
+#endif
+
+  return meta;
+
+}
+
+bool Kangaroo::IsThreadMetaCompatible(const WORK_THREAD_META &saved,const TH_PARAM &current,bool gpuThread) const {
+
+  WORK_THREAD_META now = GetThreadMeta(current,gpuThread);
+  return saved.flags == now.flags &&
+         saved.gridSizeX == now.gridSizeX &&
+         saved.gridSizeY == now.gridSizeY &&
+         saved.groupSize == now.groupSize &&
+         saved.nbKangaroo == now.nbKangaroo;
+
+}
+
+uint32_t Kangaroo::GetWalkerTypeForMeta(const WORK_THREAD_META &meta,uint64_t localIndex) const {
+
+  if((meta.flags & WORK_THREAD_META_GPU) == 0U || meta.gridSizeY == 0U || meta.groupSize == 0U) {
+    return (uint32_t)(localIndex & 1ULL);
+  }
+
+  uint64_t walkersPerBlock = (uint64_t)meta.gridSizeY * (uint64_t)meta.groupSize;
+  if(walkersPerBlock == 0ULL) {
+    return (uint32_t)(localIndex & 1ULL);
+  }
+
+  uint64_t rem = localIndex % walkersPerBlock;
+  uint64_t t = rem % (uint64_t)meta.gridSizeY;
+  return (uint32_t)(t & 1ULL);
+
+}
+
+bool Kangaroo::ClassifyKangarooType(const Int *px,const Int *py,const Int *d,uint32_t *type) {
+
+  if(type == NULL) {
+    return false;
+  }
+
+  (void)py;
+  auto sameX = [&](const Point &p) -> bool {
+    return p.x.bits64[0] == px->bits64[0] &&
+           p.x.bits64[1] == px->bits64[1] &&
+           p.x.bits64[2] == px->bits64[2] &&
+           p.x.bits64[3] == px->bits64[3];
+  };
+
+  Int dist(*d);
+  Point walk = secp->ComputePublicKey(&dist);
+  if(sameX(walk)) {
+    *type = TAME;
+    return true;
+  }
+
+  Point wild = secp->AddDirect(keyToSearch,walk);
+  if(sameX(wild)) {
+    *type = WILD;
+    return true;
+  }
+
+#ifdef USE_SYMMETRY
+  Point wildAlt = secp->AddDirect(keyToSearchNeg,walk);
+  if(sameX(wildAlt)) {
+    *type = WILD;
+    return true;
+  }
+#endif
+
+  return false;
+
+}
+
+bool Kangaroo::SaveThreadLayout(FILE *f,TH_PARAM *threads,int nbThread) {
+
+  uint32_t magic = WORK_THREAD_META_MAGIC;
+  uint32_t threadCount = (threads != NULL && nbThread > 0) ? (uint32_t)nbThread : 0U;
+
+  if(::fwrite(&magic,sizeof(uint32_t),1,f) != 1) return false;
+  if(::fwrite(&threadCount,sizeof(uint32_t),1,f) != 1) return false;
+
+  for(int i = 0; i < nbThread; i++) {
+    bool gpuThread = (i >= nbCPUThread);
+    WORK_THREAD_META meta = GetThreadMeta(threads[i],gpuThread);
+    if(::fwrite(&meta.flags,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fwrite(&meta.gridSizeX,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fwrite(&meta.gridSizeY,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fwrite(&meta.groupSize,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fwrite(&meta.nbKangaroo,sizeof(uint64_t),1,f) != 1) return false;
+  }
+
+  return true;
+
+}
+
+bool Kangaroo::LoadThreadLayout(FILE *f) {
+
+  loadedWorkHasThreadMeta = false;
+  loadedWorkThreadMeta.clear();
+
+  uint32_t magic = 0U;
+  uint32_t threadCount = 0U;
+  if(::fread(&magic,sizeof(uint32_t),1,f) != 1) {
+    ::printf("LoadWork: ERROR - cannot read thread layout metadata magic\n");
+    return false;
+  }
+  if(::fread(&threadCount,sizeof(uint32_t),1,f) != 1) {
+    ::printf("LoadWork: ERROR - cannot read thread layout metadata count\n");
+    return false;
+  }
+  if(magic != WORK_THREAD_META_MAGIC) {
+    ::printf("LoadWork: ERROR - invalid thread layout metadata magic 0x%08X\n",magic);
+    return false;
+  }
+
+  // v3 允许写入空线程布局，表示“没有可直接恢复的布局信息”，后续按 legacy 路径重排。
+  if(threadCount == 0U) {
+    loadedWorkHasThreadMeta = false;
+    return true;
+  }
+
+  loadedWorkThreadMeta.reserve(threadCount);
+  uint64_t totalWalk = 0ULL;
+  for(uint32_t i = 0; i < threadCount; i++) {
+    WORK_THREAD_META meta;
+    memset(&meta,0,sizeof(meta));
+    if(::fread(&meta.flags,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fread(&meta.gridSizeX,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fread(&meta.gridSizeY,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fread(&meta.groupSize,sizeof(uint32_t),1,f) != 1) return false;
+    if(::fread(&meta.nbKangaroo,sizeof(uint64_t),1,f) != 1) return false;
+    loadedWorkThreadMeta.push_back(meta);
+    totalWalk += meta.nbKangaroo;
+  }
+
+  if(totalWalk != (uint64_t)nbLoadedWalk) {
+    ::printf("LoadWork: ERROR - thread layout metadata count mismatch (%" PRIu64 " != %" PRIu64 ")\n",
+             totalWalk,
+             (uint64_t)nbLoadedWalk);
+    loadedWorkThreadMeta.clear();
+    return false;
+  }
+
+  loadedWorkHasThreadMeta = true;
+  return true;
+
+}
+
+void Kangaroo::AllocateThreadKangaroos(TH_PARAM *threads,int nbThread) {
+
+  for(int i = 0; i < nbThread; i++) {
+    uint64_t n = threads[i].nbKangaroo;
+    threads[i].px = new Int[n];
+    threads[i].py = new Int[n];
+    threads[i].distance = new Int[n];
+#ifdef USE_SYMMETRY
+    threads[i].symClass = new uint64_t[n];
+    memset(threads[i].symClass,0,(size_t)n * sizeof(uint64_t));
+#endif
+  }
+
+}
+
+void Kangaroo::FreeThreadKangaroos(TH_PARAM *threads,int nbThread) {
+
+  if(threads == NULL) {
+    return;
+  }
+
+  for(int i = 0; i < nbThread; i++) {
+    if(threads[i].px) {
+      delete[] threads[i].px;
+      threads[i].px = NULL;
+    }
+    if(threads[i].py) {
+      delete[] threads[i].py;
+      threads[i].py = NULL;
+    }
+    if(threads[i].distance) {
+      delete[] threads[i].distance;
+      threads[i].distance = NULL;
+    }
+#ifdef USE_SYMMETRY
+    if(threads[i].symClass) {
+      delete[] threads[i].symClass;
+      threads[i].symClass = NULL;
+    }
+#endif
+  }
+
+}
+
+bool Kangaroo::RebuildCleanHashTable(uint64_t *kept,uint64_t *removed,uint64_t *duplicates,uint64_t *conflicts) {
+
+  uint64_t keptCount = 0ULL;
+  uint64_t removedCount = 0ULL;
+  uint64_t duplicateCount = 0ULL;
+  uint64_t conflictCount = 0ULL;
+  HashTable cleanTable;
+  Point Z;
+  Z.Clear();
+
+  for(uint32_t h = 0; h < HASH_SIZE; h++) {
+    uint32_t nbItem = hashTable.E[h].nbItem;
+    if(nbItem == 0) {
+      continue;
+    }
+
+    std::vector<Int> dists;
+    std::vector<uint32_t> types;
+    std::vector<Point> bases;
+    dists.reserve(nbItem);
+    types.reserve(nbItem);
+    bases.reserve(nbItem);
+
+    for(uint32_t i = 0; i < nbItem; i++) {
+      ENTRY *e = hashTable.E[h].items[i];
+      Int dist;
+      uint32_t kType;
+      HashTable::CalcDistAndType(e->d,&dist,&kType);
+      dists.push_back(dist);
+      types.push_back(kType);
+      bases.push_back(kType == TAME ? Z : keyToSearch);
+    }
+
+    std::vector<Point> walks = secp->ComputePublicKeys(dists);
+    std::vector<Point> expected = secp->AddDirect(bases,walks);
+    std::vector<uint8_t> valid(nbItem,0U);
+    std::vector<uint32_t> unresolvedWild;
+    unresolvedWild.reserve(nbItem);
+
+    for(uint32_t i = 0; i < nbItem; i++) {
+      ENTRY *e = hashTable.E[h].items[i];
+      bool ok = ((expected[i].x.bits64[2] & HASH_MASK) == h) &&
+                (expected[i].x.bits64[0] == e->x.i64[0]) &&
+                (expected[i].x.bits64[1] == e->x.i64[1]);
+      if(ok) {
+        valid[i] = 1U;
+      } else if(types[i] == WILD) {
+        unresolvedWild.push_back(i);
+      }
+    }
+
+#ifdef USE_SYMMETRY
+    if(!unresolvedWild.empty()) {
+      std::vector<Point> altBases;
+      std::vector<Point> altInputs;
+      altBases.reserve(unresolvedWild.size());
+      altInputs.reserve(unresolvedWild.size());
+      for(uint32_t idx : unresolvedWild) {
+        altBases.push_back(keyToSearchNeg);
+        altInputs.push_back(walks[idx]);
+      }
+      std::vector<Point> altExpected = secp->AddDirect(altBases,altInputs);
+      for(size_t j = 0; j < unresolvedWild.size(); j++) {
+        uint32_t idx = unresolvedWild[j];
+        ENTRY *e = hashTable.E[h].items[idx];
+        bool ok = ((altExpected[j].x.bits64[2] & HASH_MASK) == h) &&
+                  (altExpected[j].x.bits64[0] == e->x.i64[0]) &&
+                  (altExpected[j].x.bits64[1] == e->x.i64[1]);
+        if(ok) {
+          valid[idx] = 1U;
+        }
+      }
+    }
+#endif
+
+    for(uint32_t i = 0; i < nbItem; i++) {
+      ENTRY *e = hashTable.E[h].items[i];
+      if(valid[i] == 0U) {
+        removedCount++;
+        continue;
+      }
+
+      int addStatus = cleanTable.Add(h,&e->x,&e->d);
+      if(addStatus == ADD_OK) {
+        keptCount++;
+      } else if(addStatus == ADD_DUPLICATE) {
+        duplicateCount++;
+      } else {
+        conflictCount++;
+      }
+    }
+  }
+
+  hashTable.Reset();
+  hashTable = cleanTable;
+
+  if(kept) *kept = keptCount;
+  if(removed) *removed = removedCount;
+  if(duplicates) *duplicates = duplicateCount;
+  if(conflicts) *conflicts = conflictCount;
+
+  return true;
+
+}
+
+bool Kangaroo::RestoreKangaroosDirect(TH_PARAM *threads,int nbThread,std::vector<int192_t> *kangs) {
+
+  for(int i = 0; i < nbThread; i++) {
+    uint64_t n = threads[i].nbKangaroo;
+    if(kangs == NULL)
+      FetchWalks(n,
+                 threads[i].px,
+                 threads[i].py,
+                 threads[i].distance,
+#ifdef USE_SYMMETRY
+                 threads[i].symClass
+#else
+                 NULL
+#endif
+                 );
+    else
+      FetchWalks(n,*kangs,
+                 threads[i].px,
+                 threads[i].py,
+                 threads[i].distance,
+#ifdef USE_SYMMETRY
+                 threads[i].symClass
+#else
+                 NULL
+#endif
+                 );
+  }
+
+  return true;
+
+}
+
+bool Kangaroo::RestoreKangaroosReordered(TH_PARAM *threads,int nbThread,std::vector<int192_t> *kangs,
+                                         bool tolerateInvalid,bool trustSourceMeta,uint64_t *invalidDiscarded,
+                                         uint64_t *restoredCount,uint64_t *unhandledCount) {
+
+  uint64_t droppedInvalid = 0ULL;
+
+  std::vector<WORK_THREAD_META> targetMeta;
+  targetMeta.reserve(nbThread);
+  for(int i = 0; i < nbThread; i++) {
+    targetMeta.push_back(GetThreadMeta(threads[i],i >= nbCPUThread));
+  }
+
+  // 先按当前几何生成一份全新的 herd，后续仅把旧状态覆盖到匹配槽位。
+  for(int i = 0; i < nbCPUThread; i++) {
+    CreateHerd(CPU_GRP_SIZE,threads[i].px,threads[i].py,threads[i].distance,TAME);
+#ifdef USE_SYMMETRY
+    if(threads[i].symClass != NULL) {
+      memset(threads[i].symClass,0,(size_t)threads[i].nbKangaroo * sizeof(uint64_t));
+    }
+#endif
+  }
+
+#ifdef WITHGPU
+  for(int i = nbCPUThread; i < nbThread; i++) {
+    uint64_t n = threads[i].nbKangaroo;
+    uint64_t y = (uint64_t)threads[i].gridSizeY;
+    uint64_t gSize = (uint64_t)threads[i].groupSize;
+    if(y == 0ULL || gSize == 0ULL || n != (uint64_t)threads[i].gridSizeX * y * gSize) {
+      CreateHerd((int)n,threads[i].px,threads[i].py,threads[i].distance,TAME);
+    } else {
+      uint64_t walkersPerBlock = y * gSize;
+      for(int b = 0; b < threads[i].gridSizeX; b++) {
+        uint64_t blockBase = (uint64_t)b * walkersPerBlock;
+        for(uint64_t g = 0; g < gSize; g++) {
+          uint64_t base = blockBase + g * y;
+          CreateHerd((int)y,
+                     &(threads[i].px[base]),
+                     &(threads[i].py[base]),
+                     &(threads[i].distance[base]),
+                     TAME);
+        }
+      }
+    }
+#ifdef USE_SYMMETRY
+    if(threads[i].symClass != NULL) {
+      memset(threads[i].symClass,0,(size_t)threads[i].nbKangaroo * sizeof(uint64_t));
+    }
+#endif
+  }
+#endif
+
+  struct SlotCursor {
+    int threadIndex;
+    uint64_t localIndex;
+  };
+  SlotCursor cursors[2] = {{0,0ULL},{0,0ULL}};
+
+  auto nextSlot = [&](uint32_t type,SlotCursor *cursor,int *threadIndex,uint64_t *localIndex) -> bool {
+    while(cursor->threadIndex < nbThread) {
+      const WORK_THREAD_META &meta = targetMeta[(size_t)cursor->threadIndex];
+      while(cursor->localIndex < meta.nbKangaroo) {
+        uint64_t idx = cursor->localIndex++;
+        if(GetWalkerTypeForMeta(meta,idx) == type) {
+          *threadIndex = cursor->threadIndex;
+          *localIndex = idx;
+          return true;
+        }
+      }
+      cursor->threadIndex++;
+      cursor->localIndex = 0ULL;
+    }
+    return false;
+  };
+
+  auto placeWalker = [&](const Int &x,const Int &y,const Int &d,uint64_t symClass,uint32_t type) -> bool {
+    static_assert(TAME == 0 && WILD == 1,"kangaroo type enum must stay binary");
+    int threadIndex = 0;
+    uint64_t localIndex = 0ULL;
+    if(!nextSlot(type,&cursors[type],&threadIndex,&localIndex)) {
+      return false;
+    }
+    threads[threadIndex].px[localIndex] = x;
+    threads[threadIndex].py[localIndex] = y;
+    threads[threadIndex].distance[localIndex] = d;
+#ifdef USE_SYMMETRY
+    if(threads[threadIndex].symClass != NULL) {
+      threads[threadIndex].symClass[localIndex] = symClass & 1ULL;
+    }
+#endif
+    return true;
+  };
+
+  uint64_t remaining = (uint64_t)nbLoadedWalk;
+  uint64_t restored = 0ULL;
+  uint64_t unhandled = 0ULL;
+  const uint64_t chunkSize = 4096ULL;
+
+  auto processChunk = [&](const std::vector<Int> &xs,
+                          const std::vector<Int> &ys,
+                          const std::vector<Int> &ds,
+                          const std::vector<uint64_t> &symClasses,
+                          const std::vector<uint32_t> *knownTypes) -> bool {
+    std::vector<uint32_t> resolvedTypes;
+    if(knownTypes == NULL) {
+      resolvedTypes.resize(xs.size());
+      std::vector<Int> dists(ds.begin(),ds.end());
+      std::vector<Point> walks = secp->ComputePublicKeys(dists);
+      std::vector<size_t> unresolved;
+      unresolved.reserve(xs.size());
+
+      auto sameXAt = [&](const Point &p,size_t i) -> bool {
+        return p.x.bits64[0] == xs[i].bits64[0] &&
+               p.x.bits64[1] == xs[i].bits64[1] &&
+               p.x.bits64[2] == xs[i].bits64[2] &&
+               p.x.bits64[3] == xs[i].bits64[3];
+      };
+
+      for(size_t i = 0; i < xs.size(); i++) {
+        if(sameXAt(walks[i],i)) {
+          resolvedTypes[i] = TAME;
+        } else {
+          unresolved.push_back(i);
+        }
+      }
+
+      if(!unresolved.empty()) {
+        std::vector<Point> wildBases;
+        std::vector<Point> wildInputs;
+        wildBases.reserve(unresolved.size());
+        wildInputs.reserve(unresolved.size());
+        for(size_t idx : unresolved) {
+          wildBases.push_back(keyToSearch);
+          wildInputs.push_back(walks[idx]);
+        }
+        std::vector<Point> wilds = secp->AddDirect(wildBases,wildInputs);
+        std::vector<size_t> unresolvedAlt;
+        unresolvedAlt.reserve(unresolved.size());
+        for(size_t j = 0; j < unresolved.size(); j++) {
+          size_t idx = unresolved[j];
+          if(sameXAt(wilds[j],idx)) {
+            resolvedTypes[idx] = WILD;
+          } else {
+            unresolvedAlt.push_back(idx);
+          }
+        }
+
+#ifdef USE_SYMMETRY
+        if(!unresolvedAlt.empty()) {
+          std::vector<Point> altBases;
+          std::vector<Point> altInputs;
+          altBases.reserve(unresolvedAlt.size());
+          altInputs.reserve(unresolvedAlt.size());
+          for(size_t idx : unresolvedAlt) {
+            altBases.push_back(keyToSearchNeg);
+            altInputs.push_back(walks[idx]);
+          }
+          std::vector<Point> wildAlt = secp->AddDirect(altBases,altInputs);
+          std::vector<size_t> stillUnresolved;
+          stillUnresolved.reserve(unresolvedAlt.size());
+          for(size_t j = 0; j < unresolvedAlt.size(); j++) {
+            size_t idx = unresolvedAlt[j];
+            if(sameXAt(wildAlt[j],idx)) {
+              resolvedTypes[idx] = WILD;
+            } else {
+              stillUnresolved.push_back(idx);
+            }
+          }
+          unresolvedAlt.swap(stillUnresolved);
+        }
+        if(!unresolvedAlt.empty()) {
+          if(!tolerateInvalid) {
+            ::printf("FectchKangaroos: ERROR - cannot classify restored kangaroo #%zu\n",unresolvedAlt[0]);
+            return false;
+          }
+          droppedInvalid += (uint64_t)unresolvedAlt.size();
+          for(size_t idx : unresolvedAlt) {
+            resolvedTypes[idx] = 2U;
+          }
+        }
+#else
+        if(!unresolvedAlt.empty()) {
+          if(!tolerateInvalid) {
+            ::printf("FectchKangaroos: ERROR - cannot classify restored kangaroo #%zu\n",unresolvedAlt[0]);
+            return false;
+          }
+          droppedInvalid += (uint64_t)unresolvedAlt.size();
+          for(size_t idx : unresolvedAlt) {
+            resolvedTypes[idx] = 2U;
+          }
+        }
+#endif
+      }
+
+      for(size_t i = 0; i < xs.size(); i++) {
+        if(resolvedTypes[i] == 2U && tolerateInvalid) {
+          continue;
+        }
+        if(resolvedTypes[i] != TAME && resolvedTypes[i] != WILD) {
+          ::printf("FectchKangaroos: ERROR - unresolved kangaroo type at #%zu\n",i);
+          return false;
+        }
+      }
+      knownTypes = &resolvedTypes;
+    }
+
+    for(size_t i = 0; i < xs.size(); i++) {
+      if((*knownTypes)[i] == 2U && tolerateInvalid) {
+        continue;
+      }
+      if(placeWalker(xs[i],ys[i],ds[i],symClasses[i],(*knownTypes)[i])) {
+        restored++;
+      } else {
+        unhandled++;
+      }
+    }
+    return true;
+  };
+
+  std::vector<WORK_THREAD_META> sourceMeta;
+  if(kangs != NULL) {
+    WORK_THREAD_META meta;
+    memset(&meta,0,sizeof(meta));
+    meta.nbKangaroo = (uint64_t)kangs->size();
+    sourceMeta.push_back(meta);
+  } else if(loadedWorkHasThreadMeta) {
+    sourceMeta = loadedWorkThreadMeta;
+  } else {
+    WORK_THREAD_META meta;
+    memset(&meta,0,sizeof(meta));
+    meta.nbKangaroo = (uint64_t)nbLoadedWalk;
+    sourceMeta.push_back(meta);
+  }
+
+  for(size_t threadIdx = 0; threadIdx < sourceMeta.size() && remaining > 0ULL; threadIdx++) {
+    const WORK_THREAD_META &meta = sourceMeta[threadIdx];
+    uint64_t toRead = std::min<uint64_t>(meta.nbKangaroo,remaining);
+    uint64_t sourceIndex = 0ULL;
+
+    while(toRead > 0ULL) {
+      uint64_t batch = std::min<uint64_t>(toRead,chunkSize);
+      std::vector<Int> xs((size_t)batch);
+      std::vector<Int> ys((size_t)batch);
+      std::vector<Int> ds((size_t)batch);
+      std::vector<uint64_t> symClasses((size_t)batch,0ULL);
+      std::vector<uint32_t> knownTypes;
+      bool haveKnownTypes = false;
+
+      if(kangs == NULL) {
+        if(loadedWorkHasThreadMeta && trustSourceMeta) {
+          knownTypes.resize((size_t)batch);
+          haveKnownTypes = true;
+        }
+        for(uint64_t i = 0; i < batch; i++) {
+          ::fread(&xs[(size_t)i].bits64,32,1,fRead); xs[(size_t)i].bits64[4] = 0;
+          ::fread(&ys[(size_t)i].bits64,32,1,fRead); ys[(size_t)i].bits64[4] = 0;
+          ::fread(&ds[(size_t)i].bits64,32,1,fRead); ds[(size_t)i].bits64[4] = 0;
+          if(loadedWorkHasSymClass) {
+            uint64_t sc = 0ULL;
+            ::fread(&sc,sizeof(uint64_t),1,fRead);
+            symClasses[(size_t)i] = sc & 1ULL;
+          }
+          if(haveKnownTypes) {
+            knownTypes[(size_t)i] = GetWalkerTypeForMeta(meta,sourceIndex + i);
+          }
+        }
+      } else {
+        knownTypes.resize((size_t)batch);
+        haveKnownTypes = true;
+        for(uint64_t i = 0; i < batch; i++) {
+          Int dist;
+          uint32_t type;
+          HashTable::CalcDistAndType((*kangs)[(size_t)sourceIndex + (size_t)i],&dist,&type);
+          Point walk = secp->ComputePublicKey(&dist);
+          Point sum = walk;
+          if(type == WILD) {
+            sum = secp->AddDirect(keyToSearch,walk);
+          }
+          xs[(size_t)i].Set(&sum.x);
+          ys[(size_t)i].Set(&sum.y);
+          ds[(size_t)i].Set(&dist);
+          knownTypes[(size_t)i] = type;
+        }
+      }
+
+      if(!processChunk(xs,ys,ds,symClasses,haveKnownTypes ? &knownTypes : NULL)) {
+        return false;
+      }
+
+      sourceIndex += batch;
+      toRead -= batch;
+      remaining -= batch;
+      nbLoadedWalk -= (int64_t)batch;
+    }
+  }
+
+  if(remaining > 0ULL) {
+    unhandled += remaining;
+    nbLoadedWalk -= (int64_t)remaining;
+  }
+
+  if(unhandled > 0ULL) {
+    ::printf("FectchKangaroos: Warning %.0f unhandled kangaroos !\n",(double)unhandled);
+  }
+  if(invalidDiscarded != NULL) {
+    *invalidDiscarded = droppedInvalid;
+  }
+  if(restoredCount != NULL) {
+    *restoredCount = restored;
+  }
+  if(unhandledCount != NULL) {
+    *unhandledCount = unhandled;
+  }
+  ::printf("FectchKangaroos: Repacked across geometry [%.0f restored] [%.0f kept fresh]",
+           (double)restored,
+           (double)(totalRW > restored ? totalRW - restored : 0ULL));
+  if(droppedInvalid > 0ULL) {
+    ::printf(" [%.0f invalid dropped]",(double)droppedInvalid);
+  }
+  ::printf("\n");
+
+  return true;
+
+}
+
+bool Kangaroo::StreamRepairableKangaroos(FILE *fOut,uint64_t *kept,uint64_t *invalidDiscarded) {
+
+  if(fOut == NULL) {
+    return false;
+  }
+
+  uint64_t keptCount = 0ULL;
+  uint64_t droppedInvalid = 0ULL;
+  uint64_t remaining = (uint64_t)nbLoadedWalk;
+  const uint64_t chunkSize = 4096ULL;
+
+  auto sameXAt = [](const Point &p,const std::vector<Int> &xs,size_t i) -> bool {
+    return p.x.bits64[0] == xs[i].bits64[0] &&
+           p.x.bits64[1] == xs[i].bits64[1] &&
+           p.x.bits64[2] == xs[i].bits64[2] &&
+           p.x.bits64[3] == xs[i].bits64[3];
+  };
+
+  auto flushChunk = [&](const std::vector<Int> &xs,
+                        const std::vector<Int> &ys,
+                        const std::vector<Int> &ds,
+                        const std::vector<uint64_t> &symClasses) -> bool {
+    std::vector<uint32_t> resolvedTypes(xs.size(),2U);
+    std::vector<Int> dists(ds.begin(),ds.end());
+    std::vector<Point> walks = secp->ComputePublicKeys(dists);
+    std::vector<size_t> unresolved;
+    unresolved.reserve(xs.size());
+
+    for(size_t i = 0; i < xs.size(); i++) {
+      if(sameXAt(walks[i],xs,i)) {
+        resolvedTypes[i] = TAME;
+      } else {
+        unresolved.push_back(i);
+      }
+    }
+
+    if(!unresolved.empty()) {
+      std::vector<Point> wildBases;
+      std::vector<Point> wildInputs;
+      wildBases.reserve(unresolved.size());
+      wildInputs.reserve(unresolved.size());
+      for(size_t idx : unresolved) {
+        wildBases.push_back(keyToSearch);
+        wildInputs.push_back(walks[idx]);
+      }
+      std::vector<Point> wilds = secp->AddDirect(wildBases,wildInputs);
+      std::vector<size_t> unresolvedAlt;
+      unresolvedAlt.reserve(unresolved.size());
+      for(size_t j = 0; j < unresolved.size(); j++) {
+        size_t idx = unresolved[j];
+        if(sameXAt(wilds[j],xs,idx)) {
+          resolvedTypes[idx] = WILD;
+        } else {
+          unresolvedAlt.push_back(idx);
+        }
+      }
+
+#ifdef USE_SYMMETRY
+      if(!unresolvedAlt.empty()) {
+        std::vector<Point> altBases;
+        std::vector<Point> altInputs;
+        altBases.reserve(unresolvedAlt.size());
+        altInputs.reserve(unresolvedAlt.size());
+        for(size_t idx : unresolvedAlt) {
+          altBases.push_back(keyToSearchNeg);
+          altInputs.push_back(walks[idx]);
+        }
+        std::vector<Point> wildAlt = secp->AddDirect(altBases,altInputs);
+        std::vector<size_t> stillUnresolved;
+        stillUnresolved.reserve(unresolvedAlt.size());
+        for(size_t j = 0; j < unresolvedAlt.size(); j++) {
+          size_t idx = unresolvedAlt[j];
+          if(sameXAt(wildAlt[j],xs,idx)) {
+            resolvedTypes[idx] = WILD;
+          } else {
+            stillUnresolved.push_back(idx);
+          }
+        }
+        unresolvedAlt.swap(stillUnresolved);
+      }
+#endif
+      droppedInvalid += (uint64_t)unresolvedAlt.size();
+    }
+
+    for(size_t i = 0; i < xs.size(); i++) {
+      if(resolvedTypes[i] == 2U) {
+        continue;
+      }
+      if(::fwrite(&xs[i].bits64,32,1,fOut) != 1) return false;
+      if(::fwrite(&ys[i].bits64,32,1,fOut) != 1) return false;
+      if(::fwrite(&ds[i].bits64,32,1,fOut) != 1) return false;
+#ifdef USE_SYMMETRY
+      uint64_t sc = symClasses[i] & 1ULL;
+      if(::fwrite(&sc,sizeof(uint64_t),1,fOut) != 1) return false;
+#endif
+      keptCount++;
+    }
+
+    return true;
+  };
+
+  std::vector<WORK_THREAD_META> sourceMeta;
+  if(loadedWorkHasThreadMeta && !loadedWorkThreadMeta.empty()) {
+    sourceMeta = loadedWorkThreadMeta;
+  } else {
+    WORK_THREAD_META meta;
+    memset(&meta,0,sizeof(meta));
+    meta.nbKangaroo = remaining;
+    sourceMeta.push_back(meta);
+  }
+
+  for(size_t threadIdx = 0; threadIdx < sourceMeta.size() && remaining > 0ULL; threadIdx++) {
+    uint64_t toRead = std::min<uint64_t>(sourceMeta[threadIdx].nbKangaroo,remaining);
+    while(toRead > 0ULL) {
+      uint64_t batch = std::min<uint64_t>(toRead,chunkSize);
+      std::vector<Int> xs((size_t)batch);
+      std::vector<Int> ys((size_t)batch);
+      std::vector<Int> ds((size_t)batch);
+      std::vector<uint64_t> symClasses((size_t)batch,0ULL);
+
+      for(uint64_t i = 0; i < batch; i++) {
+        ::fread(&xs[(size_t)i].bits64,32,1,fRead); xs[(size_t)i].bits64[4] = 0;
+        ::fread(&ys[(size_t)i].bits64,32,1,fRead); ys[(size_t)i].bits64[4] = 0;
+        ::fread(&ds[(size_t)i].bits64,32,1,fRead); ds[(size_t)i].bits64[4] = 0;
+        if(loadedWorkHasSymClass) {
+          uint64_t sc = 0ULL;
+          ::fread(&sc,sizeof(uint64_t),1,fRead);
+          symClasses[(size_t)i] = sc & 1ULL;
+        }
+      }
+
+      if(!flushChunk(xs,ys,ds,symClasses)) {
+        return false;
+      }
+
+      toRead -= batch;
+      remaining -= batch;
+      nbLoadedWalk -= (int64_t)batch;
+    }
+  }
+
+  if(remaining > 0ULL) {
+    droppedInvalid += remaining;
+    nbLoadedWalk -= (int64_t)remaining;
+  }
+
+  if(kept != NULL) {
+    *kept = keptCount;
+  }
+  if(invalidDiscarded != NULL) {
+    *invalidDiscarded = droppedInvalid;
+  }
+
+  return true;
+
 }
 
 // ----------------------------------------------------------------------------
@@ -361,74 +1196,50 @@ void Kangaroo::FectchKangaroos(TH_PARAM *threads) {
 
     uint64_t nbSaved = nbLoadedWalk;
     uint64_t created = 0;
+    int nbThread = nbCPUThread + nbGPUThread;
+    AllocateThreadKangaroos(threads,nbThread);
 
-    // Fetch loaded walk
-    for(int i = 0; i < nbCPUThread; i++) {
-      threads[i].px = new Int[CPU_GRP_SIZE];
-      threads[i].py = new Int[CPU_GRP_SIZE];
-      threads[i].distance = new Int[CPU_GRP_SIZE];
-#ifdef USE_SYMMETRY
-      threads[i].symClass = new uint64_t[CPU_GRP_SIZE];
-#endif
-      if(!saveKangarooByServer)
-        FetchWalks(CPU_GRP_SIZE,threads[i].px,threads[i].py,threads[i].distance,
-#ifdef USE_SYMMETRY
-                   threads[i].symClass
-#else
-                   NULL
-#endif
-                   );
-      else
-        FetchWalks(CPU_GRP_SIZE,kangs,threads[i].px,threads[i].py,threads[i].distance,
-#ifdef USE_SYMMETRY
-                   threads[i].symClass
-#else
-                   NULL
-#endif
-                   );
+    bool canRestoreDirect = false;
+    if(!saveKangarooByServer && loadedWorkHasThreadMeta &&
+       (int)loadedWorkThreadMeta.size() == nbThread) {
+      canRestoreDirect = true;
+      for(int i = 0; i < nbThread; i++) {
+        if(!IsThreadMetaCompatible(loadedWorkThreadMeta[(size_t)i],threads[i],i >= nbCPUThread)) {
+          canRestoreDirect = false;
+          break;
+        }
+      }
     }
 
-#ifdef WITHGPU
-    for(int i = 0; i < nbGPUThread; i++) {
-      ::printf(".");
-      int id = nbCPUThread + i;
-      uint64_t n = threads[id].nbKangaroo;
-      threads[id].px = new Int[n];
-      threads[id].py = new Int[n];
-      threads[id].distance = new Int[n];
-#ifdef USE_SYMMETRY
-      threads[id].symClass = new uint64_t[n];
-#endif
-      if(!saveKangarooByServer)
-          FetchWalks(n,
-            threads[id].px,
-            threads[id].py,
-            threads[id].distance,
-#ifdef USE_SYMMETRY
-            threads[id].symClass
-#else
-            NULL
-#endif
-            );
-      else
-          FetchWalks(n,kangs,
-            threads[id].px,
-            threads[id].py,
-            threads[id].distance,
-#ifdef USE_SYMMETRY
-            threads[id].symClass
-#else
-            NULL
-#endif
-            );
+    bool ok = false;
+    if(canRestoreDirect) {
+      ::printf(" [direct]");
+      ok = RestoreKangaroosDirect(threads,nbThread,NULL);
+    } else if(saveKangarooByServer) {
+      ::printf(" [repack:server]");
+      ok = RestoreKangaroosReordered(threads,nbThread,&kangs,false,true,NULL);
+    } else {
+      if(loadedWorkHasThreadMeta) {
+        ::printf(" [repack:geometry]");
+      } else {
+        ::printf(" [repack:legacy]");
+      }
+      ok = RestoreKangaroosReordered(threads,nbThread,NULL,false,true,NULL);
     }
-#endif
+    if(!ok) {
+      ::printf("\nFectchKangaroos: failed to restore kangaroo state\n");
+      if(fRead) {
+        fclose(fRead);
+        fRead = NULL;
+      }
+      ::exit(0);
+    }
 
     ::printf("Done\n");
 
     double eFetch = Timer::get_tick();
 
-    if(nbLoadedWalk != 0) {
+    if(nbLoadedWalk != 0 && !saveKangarooByServer) {
       ::printf("FectchKangaroos: Warning %.0f unhandled kangaroos !\n",(double)nbLoadedWalk);
     }
 
@@ -450,13 +1261,8 @@ bool Kangaroo::SaveHeader(string fileName,FILE* f,int type,uint64_t totalCount,d
 
   // Header
   uint32_t head = type;
-  // Version 2: 192-bit distance format (ENTRY 40 bytes, kangaroo buffer KSIZE=12)
-  // Version 1: 128-bit distance with symClass
-  // Version 0: legacy 128-bit distance without symClass
-  uint32_t version = 2;
-#ifndef USE_SYMMETRY
-  version = 1; // non-symmetry path bumped to 1 to mark 192-bit distance upgrade
-#endif
+  // 当前版本增加线程布局元数据，用于跨几何恢复时重排 kangaroo 顺序。
+  uint32_t version = GetCurrentWorkFileVersion();
   if(::fwrite(&head,sizeof(uint32_t),1,f) != 1) {
     ::printf("SaveHeader: Cannot write to %s\n",fileName.c_str());
     ::printf("%s\n",::strerror(errno));
@@ -515,6 +1321,7 @@ void Kangaroo::SaveServerWork() {
 
   uint64_t totalWalk = 0;
   ::fwrite(&totalWalk,sizeof(uint64_t),1,f);
+  SaveThreadLayout(f,NULL,0);
 
   uint64_t size = FTell(f);
   fclose(f);
@@ -617,6 +1424,7 @@ void Kangaroo::SaveWork(uint64_t totalCount,double totalTime,TH_PARAM *threads,i
     for(int i = 0; i < nbThread; i++)
       totalWalk += threads[i].nbKangaroo;
     ::fwrite(&totalWalk,sizeof(uint64_t),1,f);
+    SaveThreadLayout(f,threads,nbThread);
 
     uint64_t point = totalWalk / 16;
     uint64_t pointPrint = 0;
@@ -644,6 +1452,7 @@ void Kangaroo::SaveWork(uint64_t totalCount,double totalTime,TH_PARAM *threads,i
   } else {
 
     ::fwrite(&totalWalk,sizeof(uint64_t),1,f);
+    SaveThreadLayout(f,threads,nbThread);
 
   }
 
@@ -664,6 +1473,100 @@ end:
   time_t now = time(NULL);
   ctimeBuff = ctime(&now);
   ::printf("done [%.1f MB] [%s] %s",(double)size/(1024.0*1024.0),GetTimeStr(t1 - t0).c_str(),ctimeBuff);
+
+}
+
+bool Kangaroo::CleanWorkFile(int reqCPUThread,std::vector<int> gpuId,std::vector<int> gridSize,
+                             std::string &inputFile,std::string &outputFile) {
+
+  (void)reqCPUThread;
+  (void)gpuId;
+  (void)gridSize;
+
+  if(IsDir(inputFile)) {
+    ::printf("wclean: partitioned work directory is not supported yet\n");
+    return false;
+  }
+
+  if(!LoadWork(inputFile)) {
+    return false;
+  }
+
+  InitRange();
+  CreateJumpTable();
+  keyIdx = 0;
+  InitSearchKey();
+  SetDP(initDPSize);
+
+  uint64_t kept = 0ULL;
+  uint64_t removed = 0ULL;
+  uint64_t duplicates = 0ULL;
+  uint64_t conflicts = 0ULL;
+  ::printf("Cleaning DP");
+  if(!RebuildCleanHashTable(&kept,&removed,&duplicates,&conflicts)) {
+    if(fRead) {
+      fclose(fRead);
+      fRead = NULL;
+    }
+    return false;
+  }
+  ::printf(": [kept %" PRIu64 "] [removed %" PRIu64 "] [duplicate %" PRIu64 "] [conflict %" PRIu64 "]\n",
+           kept,removed,duplicates,conflicts);
+
+  uint64_t sourceWalk = (uint64_t)nbLoadedWalk;
+  uint64_t invalidDiscarded = 0ULL;
+  uint64_t repairedCount = 0ULL;
+
+  FILE *fOut = fopen(outputFile.c_str(),"wb");
+  if(fOut == NULL) {
+    ::printf("wclean: Cannot open %s for writing\n",outputFile.c_str());
+    ::printf("%s\n",::strerror(errno));
+    if(fRead) {
+      fclose(fRead);
+      fRead = NULL;
+    }
+    return false;
+  }
+
+  ::printf("Writing clean work: %s",outputFile.c_str());
+  SaveWork(outputFile,fOut,HEADW,offsetCount,offsetTime);
+
+  uint64_t totalWalkPos = FTell(fOut);
+  uint64_t zeroWalk = 0ULL;
+  ::fwrite(&zeroWalk,sizeof(uint64_t),1,fOut);
+  SaveThreadLayout(fOut,NULL,0);
+
+  if(sourceWalk > 0ULL) {
+    ::printf("Repairing kangaroos");
+    if(!StreamRepairableKangaroos(fOut,&repairedCount,&invalidDiscarded)) {
+      if(fRead) {
+        fclose(fRead);
+        fRead = NULL;
+      }
+      fclose(fOut);
+      return false;
+    }
+  }
+
+  uint64_t endPos = FTell(fOut);
+  FSeek(fOut,totalWalkPos);
+  ::fwrite(&repairedCount,sizeof(uint64_t),1,fOut);
+  FSeek(fOut,endPos);
+  fclose(fOut);
+
+  if(fRead) {
+    fclose(fRead);
+    fRead = NULL;
+  }
+
+  ::printf("done [%.1f MB]\n",(double)endPos / (1024.0 * 1024.0));
+  ::printf("wclean: [source kangaroos %" PRIu64 "] [preserved %" PRIu64 "]",
+           sourceWalk,repairedCount);
+  if(invalidDiscarded > 0ULL) {
+    ::printf(" [invalid dropped %" PRIu64 "]",invalidDiscarded);
+  }
+  ::printf("\n");
+  return true;
 
 }
 
@@ -740,10 +1643,55 @@ void Kangaroo::WorkInfo(std::string &fName) {
 
   fread(&nbLoadedWalk,sizeof(uint64_t),1,f1);
 #ifdef WIN64
-  ::printf("Kangaroos : %I64d 2^%.3f\n",nbLoadedWalk,log2(nbLoadedWalk));
+  if(nbLoadedWalk > 0) {
+    ::printf("Kangaroos : %I64d 2^%.3f\n",nbLoadedWalk,log2(nbLoadedWalk));
+  } else {
+    ::printf("Kangaroos : %I64d\n",nbLoadedWalk);
+  }
 #else
-  ::printf("Kangaroos : %" PRId64 " 2^%.3f\n",nbLoadedWalk,log2(nbLoadedWalk));
+  if(nbLoadedWalk > 0) {
+    ::printf("Kangaroos : %" PRId64 " 2^%.3f\n",nbLoadedWalk,log2(nbLoadedWalk));
+  } else {
+    ::printf("Kangaroos : %" PRId64 "\n",nbLoadedWalk);
+  }
 #endif
+
+  if(WorkFileHasThreadMeta(version)) {
+    uint32_t magic = 0U;
+    uint32_t threadCount = 0U;
+    if(::fread(&magic,sizeof(uint32_t),1,f1) == 1 &&
+       ::fread(&threadCount,sizeof(uint32_t),1,f1) == 1 &&
+       magic == WORK_THREAD_META_MAGIC) {
+      if(threadCount == 0U) {
+        ::printf("ThreadMeta: no\n");
+      } else {
+        ::printf("ThreadMeta: yes (%u threads)\n",threadCount);
+        for(uint32_t i = 0; i < threadCount; i++) {
+          WORK_THREAD_META meta;
+          memset(&meta,0,sizeof(meta));
+          if(::fread(&meta.flags,sizeof(uint32_t),1,f1) != 1) break;
+          if(::fread(&meta.gridSizeX,sizeof(uint32_t),1,f1) != 1) break;
+          if(::fread(&meta.gridSizeY,sizeof(uint32_t),1,f1) != 1) break;
+          if(::fread(&meta.groupSize,sizeof(uint32_t),1,f1) != 1) break;
+          if(::fread(&meta.nbKangaroo,sizeof(uint64_t),1,f1) != 1) break;
+          if((meta.flags & WORK_THREAD_META_GPU) != 0U) {
+            ::printf("  Thread[%u]: GPU grid=(%u,%u) grp=%u kangaroos=%" PRIu64 "\n",
+                     i,
+                     meta.gridSizeX,
+                     meta.gridSizeY,
+                     meta.groupSize,
+                     meta.nbKangaroo);
+          } else {
+            ::printf("  Thread[%u]: CPU kangaroos=%" PRIu64 "\n",i,meta.nbKangaroo);
+          }
+        }
+      }
+    } else {
+      ::printf("ThreadMeta: invalid or missing\n");
+    }
+  } else {
+    ::printf("ThreadMeta: no\n");
+  }
 
   fclose(f1);
 

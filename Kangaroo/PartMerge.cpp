@@ -283,8 +283,8 @@ bool Kangaroo::MergeWorkPartPart(std::string& part1Name,std::string& part2Name) 
 
   if(!partIsEmpty) {
 
-    if(v1 != v2) {
-      ::printf("MergeWorkPartPart: cannot merge workfile of different version\n");
+    if(NormalizeMergeCompatibleWorkVersion(v1) != NormalizeMergeCompatibleWorkVersion(v2)) {
+      ::printf("MergeWorkPartPart: cannot merge workfile of incompatible version (%u vs %u)\n",v1,v2);
       ::fclose(f2);
       return true;
     }
@@ -603,8 +603,8 @@ bool Kangaroo::MergeWorkPart(std::string& partName,std::string& file2,bool print
     return true;
   }
 
-  if(v1 != v2) {
-    ::printf("MergeWorkPart: cannot merge workfile of different version\n");
+  if(NormalizeMergeCompatibleWorkVersion(v1) != NormalizeMergeCompatibleWorkVersion(v2)) {
+    ::printf("MergeWorkPart: cannot merge workfile of incompatible version (%u vs %u)\n",v1,v2);
     ::fclose(f2);
     return true;
   }
